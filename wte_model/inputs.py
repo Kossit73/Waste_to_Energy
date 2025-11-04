@@ -94,3 +94,55 @@ class WTEMasterInputs:
     revenue: RevenueAssumptions
     costs: CostAssumptions
     finance: FinanceAssumptions
+
+
+def default_inputs() -> WTEMasterInputs:
+    """Return a representative default input set for the model.
+
+    The values mirror the fallback assumptions used by the Excel loader so
+    they provide a sensible baseline when a workbook is not supplied.
+    """
+
+    return WTEMasterInputs(
+        timeline=Timeline(),
+        tech=TechAssumptions(
+            msw_tonnes_pa=300_000.0,
+            lhv_mj_per_kg=9.0,
+            boiler_efficiency=0.85,
+            electrical_efficiency=0.22,
+            availability=0.90,
+            parasitic_load_frac=0.10,
+        ),
+        revenue=RevenueAssumptions(
+            ppa_price_usd_per_mwh=110.0,
+            gate_fee_usd_per_t=25.0,
+            heat_price_usd_per_mwh=0.0,
+            metal_recovery_usd_per_t=0.0,
+            ash_revenue_usd_per_t=0.0,
+            ppa_escalation=0.0,
+            gate_fee_escalation=0.0,
+            other_escalation=0.0,
+        ),
+        costs=CostAssumptions(
+            capex_total_usd=180_000_000.0,
+            capex_spend_profile=None,
+            fixed_om_usd_pa=10_000_000.0,
+            variable_om_usd_per_t=15.0,
+            landfill_disposal_usd_per_t=5.0,
+            insurance_pct_of_capex_pa=0.0075,
+            maintenance_pct_of_capex_pa=0.02,
+            opex_escalation=0.02,
+        ),
+        finance=FinanceAssumptions(
+            debt_ratio=0.70,
+            interest_rate=0.08,
+            tenor_years=12,
+            grace_years=2,
+            upfront_fee_pct=0.01,
+            dscr_min=1.20,
+            tax_rate=0.25,
+            depr_years=15,
+            working_cap_days=30,
+            discount_rate=0.10,
+        ),
+    )

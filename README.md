@@ -27,6 +27,21 @@ as EBITDA, CFADS, equity cash flows, IRRs, and DSCRs.
 The script will display the mapped input values and headline financial metrics
 calculated by the model.
 
+## Streamlit dashboard
+
+You can explore the model interactively with Streamlit. The app supports both
+manual input tweaks and loading assumptions from the Excel workbook used by the
+example script.
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Once the server starts, open the provided URL in your browser. Use the sidebar
+to upload the workbook (optional) or adjust key assumptions; the main panel will
+refresh with updated IRRs, DSCRs, and period-by-period cash flows. A CSV export
+button lets you download the calculated cash-flow table.
+
 ## Package overview
 
 - `wte_model/inputs.py` – dataclasses representing the model inputs.
@@ -36,6 +51,7 @@ calculated by the model.
 - `wte_model/finance.py` – handles debt schedules, depreciation, and tax.
 - `wte_model/dcf.py` – assembles the full cash flow model and metrics.
 - `wte_model/io_excel.py` – helper to read assumptions from a macro-enabled Excel workbook.
+- `streamlit_app.py` – interactive dashboard built on top of the model.
 - `run_example.py` – example entry point that ties everything together.
 
 Feel free to adapt the input mappings or extend the model logic to match your

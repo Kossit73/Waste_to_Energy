@@ -7,6 +7,7 @@ from .inputs import (
     CostAssumptions,
     FinanceAssumptions,
     WTEMasterInputs,
+    default_inputs,
 )
 from .energy import energy_block
 from .revenue import revenue_block
@@ -29,4 +30,5 @@ __all__ = [
     "depreciation_schedule",
     "tax_block",
     "cashflow_model",
+    "default_inputs",
 ]
