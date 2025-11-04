@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path as PathLib
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
@@ -22,14 +19,13 @@ from wte_model import (
     cashflow_model,
     default_inputs,
 )
-from wte_model.io_excel import load_inputs_from_xlsm
 
 
 st.set_page_config(page_title="Waste-to-Energy Model", layout="wide")
 st.title("Waste-to-Energy Financial Workspace")
 st.caption(
-    "Upload an Excel workbook or configure assumptions in the sections below to build a "
-    "comprehensive project finance model with dashboards, statements, sensitivities, and scenarios."
+    "Configure assumptions in the sections below to build a comprehensive project finance "
+    "model with dashboards, statements, sensitivities, and scenarios."
 )
 
 
@@ -42,22 +38,6 @@ class ProjectionSettings:
     @property
     def years(self) -> int:
         return max(1, self.end_year - self.start_year + 1)
-
-
-def _load_inputs_from_upload(uploaded_file) -> WTEMasterInputs:
-    """Persist an uploaded workbook to disk and load it with the Excel parser."""
-
-    suffix = PathLib(uploaded_file.name or "inputs.xlsm").suffix or ".xlsm"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        tmp_path = tmp.name
-    try:
-        return load_inputs_from_xlsm(tmp_path)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def _parse_capex_profile(text: str, fallback: Optional[List[float]]) -> Optional[List[float]]:
@@ -189,22 +169,9 @@ def _set_default(key: str, value):
         st.session_state[key] = value
 
 
-uploaded_workbook = st.file_uploader(
-    "Upload Excel assumptions (optional)", type=["xlsm", "xlsx"], accept_multiple_files=False
-)
-
 source_label = "Default inputs"
 inputs = default_inputs()
-if uploaded_workbook is not None:
-    try:
-        inputs = _load_inputs_from_upload(uploaded_workbook)
-        source_label = uploaded_workbook.name or "Uploaded workbook"
-        st.success(f"Loaded inputs from {source_label}.")
-    except Exception as exc:  # pragma: no cover - user feedback path
-        st.error(f"Failed to read workbook: {exc}")
-
 st.caption(f"Using assumptions from: {source_label}")
-
 
 projection_defaults = ProjectionSettings(
     start_year=inputs.timeline.start_year,
