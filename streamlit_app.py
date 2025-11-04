@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from pandas.api.types import is_numeric_dtype
+from streamlit.delta_generator import DeltaGenerator
 
 from wte_model import (
     CostAssumptions,
@@ -83,6 +84,77 @@ def _blank_row(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
+def _section_header(title: str, key: str, *, level: str = "subheader") -> bool:
+    """Render a section header with an Edit toggle."""
+
+    cols = st.columns([5, 1])
+    header_fn = getattr(cols[0], level)
+    header_fn(title)
+    with cols[1]:
+        edit_enabled = st.checkbox(
+            "Edit",
+            key=f"{key}_edit_toggle",
+            help="Enable editing to modify the default figures for this section.",
+        )
+    return edit_enabled
+
+
+def _number_input_control(
+    label: str,
+    key: str,
+    *,
+    container: Optional[DeltaGenerator] = None,
+    edit_enabled: bool,
+    **kwargs,
+):
+    """Number input that honours the section edit toggle and mirrors values into session state."""
+
+    current = st.session_state.get(key, 0)
+    if isinstance(current, (np.integer, int)) and not isinstance(current, bool):
+        base_value = int(current)
+        caster = int
+    else:
+        try:
+            base_value = float(current)
+        except (TypeError, ValueError):
+            base_value = 0.0
+        caster = float
+
+    widget_fn = container.number_input if container is not None else st.number_input
+    widget_value = widget_fn(
+        label,
+        value=base_value,
+        key=f"{key}_widget",
+        disabled=not edit_enabled,
+        **kwargs,
+    )
+    if edit_enabled:
+        st.session_state[key] = caster(widget_value)
+    return st.session_state.get(key, caster(widget_value))
+
+
+def _text_area_control(
+    label: str,
+    key: str,
+    *,
+    edit_enabled: bool,
+    **kwargs,
+):
+    """Text area helper that syncs with session state and respects edit mode."""
+
+    current = st.session_state.get(key, "")
+    widget_value = st.text_area(
+        label,
+        value=current,
+        key=f"{key}_widget",
+        disabled=not edit_enabled,
+        **kwargs,
+    )
+    if edit_enabled:
+        st.session_state[key] = widget_value
+    return st.session_state.get(key, widget_value)
+
+
 def _editable_table(
     key: str,
     data: pd.DataFrame,
@@ -90,10 +162,11 @@ def _editable_table(
     column_config: Optional[Dict[str, st.column_config.BaseColumn]] = None,
     allow_row_controls: bool = True,
     new_row_factory: Optional[Callable[[], pd.DataFrame]] = None,
+    edit_enabled: bool = True,
 ) -> pd.DataFrame:
     base = _ensure_state_df(key, data.copy())
 
-    if allow_row_controls:
+    if allow_row_controls and edit_enabled:
         ctrl_cols = st.columns(2)
         with ctrl_cols[0]:
             if st.button("Add row", key=f"add_{key}"):
@@ -120,6 +193,8 @@ def _editable_table(
                     trimmed = base.drop(base.index[remove_idx]).reset_index(drop=True)
                     _update_table_state(key, trimmed)
                     st.experimental_rerun()
+    elif allow_row_controls and not edit_enabled:
+        st.caption("Enable edit mode to add or remove rows.")
 
     edited = st.data_editor(
         base,
@@ -127,9 +202,12 @@ def _editable_table(
         num_rows="dynamic",
         use_container_width=True,
         column_config=column_config or {},
+        disabled=not edit_enabled,
     )
-    _update_table_state(key, edited)
-    return edited
+    if edit_enabled:
+        _update_table_state(key, edited)
+        return edited
+    return base
 
 
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
@@ -700,61 +778,71 @@ with page_tabs[0]:
                 numeric_cols,
                 key=f"increment_column_{table_key}",
             )
-            default_base = float(table_df[column].fillna(0.0).iloc[0]) if not table_df.empty else 0.0
-            base_value = st.number_input(
-                "Base value",
-                value=float(default_base),
-                key=f"increment_base_{table_key}",
-            )
-            increment_pct = st.number_input(
-                "Annual increment (%)",
-                value=0.0,
-                step=0.5,
-                key=f"increment_pct_{table_key}",
-            )
-            if st.button("Apply increment", key=f"apply_increment_{table_key}"):
-                if table_df.empty:
-                    st.warning("Table has no rows to update.")
-                else:
-                    growth = [(1 + increment_pct / 100.0) ** i for i in range(len(table_df))]
-                    updated = table_df.copy()
-                    updated[column] = [base_value * g for g in growth]
-                    _update_table_state(table_key, updated)
-                    st.success(
-                        f"Applied {increment_pct:.2f}% annual increment to "
-                        f"{TABLE_LABELS.get(table_key, column)}"
-                    )
-                    st.experimental_rerun()
+            edit_flag = st.session_state.get(f"{table_key}_edit_toggle", False)
+            if not edit_flag:
+                st.info("Enable edit mode for this table to apply increments.")
+            else:
+                default_base = float(table_df[column].fillna(0.0).iloc[0]) if not table_df.empty else 0.0
+                base_value = st.number_input(
+                    "Base value",
+                    value=float(default_base),
+                    key=f"increment_base_{table_key}",
+                )
+                increment_pct = st.number_input(
+                    "Annual increment (%)",
+                    value=0.0,
+                    step=0.5,
+                    key=f"increment_pct_{table_key}",
+                )
+                if st.button("Apply increment", key=f"apply_increment_{table_key}"):
+                    if table_df.empty:
+                        st.warning("Table has no rows to update.")
+                    else:
+                        growth = [(1 + increment_pct / 100.0) ** i for i in range(len(table_df))]
+                        updated = table_df.copy()
+                        updated[column] = [base_value * g for g in growth]
+                        _update_table_state(table_key, updated)
+                        st.success(
+                            f"Applied {increment_pct:.2f}% annual increment to "
+                            f"{TABLE_LABELS.get(table_key, column)}"
+                        )
+                        st.experimental_rerun()
 
-    st.subheader("Projection Horizon")
+    proj_edit = _section_header("Projection Horizon", "projection_horizon")
     col_proj1, col_proj2, col_proj3 = st.columns(3)
-    start_year = col_proj1.number_input(
+    start_year = _number_input_control(
         "Start year",
+        "projection_start_year",
+        container=col_proj1,
         min_value=2000,
         max_value=2100,
-        value=int(st.session_state["projection_start_year"]),
-        key="projection_start_year",
+        step=1,
+        edit_enabled=proj_edit,
     )
-    end_year = col_proj2.number_input(
+    _number_input_control(
         "End year",
-        min_value=start_year + 1,
+        "projection_end_year",
+        container=col_proj2,
+        min_value=int(start_year) + 1,
         max_value=2150,
-        value=int(st.session_state["projection_end_year"]),
-        key="projection_end_year",
+        step=1,
+        edit_enabled=proj_edit,
     )
-    periods_per_year = col_proj3.number_input(
+    _number_input_control(
         "Periods per year",
+        "projection_ppy",
+        container=col_proj3,
         min_value=1,
         max_value=12,
-        value=int(st.session_state["projection_ppy"]),
-        key="projection_ppy",
+        step=1,
+        edit_enabled=proj_edit,
     )
     st.info(
         "The projection horizon drives the calendar footprint of every table and report in the workspace, "
         "including the monthly and annual statements."
     )
 
-    st.subheader("Global Inputs")
+    global_edit = _section_header("Global Inputs", "global_inputs")
     global_inputs = _editable_table(
         "global_inputs",
         global_defaults,
@@ -762,9 +850,10 @@ with page_tabs[0]:
             "Parameter": st.column_config.TextColumn("Parameter"),
             "Value": st.column_config.NumberColumn("Value", help="Values are captured in native units or percent."),
         },
+        edit_enabled=global_edit,
     )
 
-    st.subheader("Initial Investment Inputs")
+    initial_edit = _section_header("Initial Investment Inputs", "initial_investment")
     initial_investment = _editable_table(
         "initial_investment",
         initial_investment_defaults,
@@ -773,6 +862,7 @@ with page_tabs[0]:
             "Cost": st.column_config.NumberColumn("Cost", format="%0.0f"),
             "Life (years)": st.column_config.NumberColumn("Life (years)", min_value=1, step=1),
         },
+        edit_enabled=initial_edit,
     )
 
     schedule = _compute_initial_investment_schedule(initial_investment)
@@ -786,7 +876,7 @@ with page_tabs[0]:
 
 
 with page_tabs[1]:
-    st.subheader("Revenue Inputs")
+    revenue_edit = _section_header("Revenue Inputs", "revenue_inputs")
     revenue_table = _editable_table(
         "revenue_inputs",
         revenue_defaults,
@@ -795,11 +885,13 @@ with page_tabs[1]:
             "Price": st.column_config.NumberColumn("Price", format="%0.2f"),
             "Escalation (%)": st.column_config.NumberColumn("Escalation (%)", format="%0.2f"),
         },
+        edit_enabled=revenue_edit,
     )
 
     st.subheader("Production Assumptions")
     prod_tabs = st.tabs(["Annual", "Monthly"])
     with prod_tabs[0]:
+        prod_annual_edit = _section_header("Annual production", "production_annual")
         production_annual = _editable_table(
             "production_annual",
             production_annual_defaults,
@@ -807,8 +899,10 @@ with page_tabs[1]:
                 "Year": st.column_config.NumberColumn("Year", step=1),
                 "Throughput (t)": st.column_config.NumberColumn("Throughput (t)", format="%0.0f"),
             },
+            edit_enabled=prod_annual_edit,
         )
     with prod_tabs[1]:
+        prod_monthly_edit = _section_header("Monthly production", "production_monthly")
         production_monthly = _editable_table(
             "production_monthly",
             production_monthly_defaults,
@@ -816,121 +910,150 @@ with page_tabs[1]:
                 "Month": st.column_config.NumberColumn("Month", step=1, min_value=1, max_value=12),
                 "Throughput (t)": st.column_config.NumberColumn("Throughput (t)", format="%0.0f"),
             },
+            edit_enabled=prod_monthly_edit,
         )
 
-    st.subheader("Technology and Commercial Drivers")
+    tech_edit = _section_header("Technology Inputs", "technology_inputs")
     tech_cols = st.columns(3)
-    st.session_state["msw_tonnes_pa"] = tech_cols[0].number_input(
+    _number_input_control(
         "MSW throughput (t/a)",
+        "msw_tonnes_pa",
+        container=tech_cols[0],
         min_value=10_000.0,
         max_value=1_000_000.0,
-        value=float(st.session_state["msw_tonnes_pa"]),
         step=10_000.0,
+        edit_enabled=tech_edit,
     )
-    st.session_state["lhv_mj_per_kg"] = tech_cols[1].number_input(
+    _number_input_control(
         "Lower heating value (MJ/kg)",
+        "lhv_mj_per_kg",
+        container=tech_cols[1],
         min_value=4.0,
         max_value=18.0,
-        value=float(st.session_state["lhv_mj_per_kg"]),
         step=0.1,
+        edit_enabled=tech_edit,
     )
-    st.session_state["availability"] = tech_cols[2].number_input(
+    _number_input_control(
         "Availability",
+        "availability",
+        container=tech_cols[2],
         min_value=0.5,
         max_value=1.0,
-        value=float(st.session_state["availability"]),
         step=0.01,
+        edit_enabled=tech_edit,
     )
 
     tech_cols2 = st.columns(3)
-    st.session_state["boiler_efficiency"] = tech_cols2[0].number_input(
+    _number_input_control(
         "Boiler efficiency",
+        "boiler_efficiency",
+        container=tech_cols2[0],
         min_value=0.3,
         max_value=1.0,
-        value=float(st.session_state["boiler_efficiency"]),
         step=0.01,
+        edit_enabled=tech_edit,
     )
-    st.session_state["electrical_efficiency"] = tech_cols2[1].number_input(
+    _number_input_control(
         "Electrical efficiency",
+        "electrical_efficiency",
+        container=tech_cols2[1],
         min_value=0.1,
         max_value=0.5,
-        value=float(st.session_state["electrical_efficiency"]),
         step=0.01,
+        edit_enabled=tech_edit,
     )
-    st.session_state["parasitic_load"] = tech_cols2[2].number_input(
+    _number_input_control(
         "Parasitic load fraction",
+        "parasitic_load",
+        container=tech_cols2[2],
         min_value=0.0,
         max_value=0.3,
-        value=float(st.session_state["parasitic_load"]),
         step=0.01,
+        edit_enabled=tech_edit,
     )
 
-    st.subheader("Commercial Terms")
+    commercial_edit = _section_header("Commercial Terms", "commercial_terms")
     comm_cols = st.columns(3)
-    st.session_state["ppa_price"] = comm_cols[0].number_input(
+    _number_input_control(
         "PPA price (USD/MWh)",
+        "ppa_price",
+        container=comm_cols[0],
         min_value=0.0,
         max_value=500.0,
-        value=float(st.session_state["ppa_price"]),
         step=1.0,
+        edit_enabled=commercial_edit,
     )
-    st.session_state["gate_fee"] = comm_cols[1].number_input(
+    _number_input_control(
         "Gate fee (USD/t)",
+        "gate_fee",
+        container=comm_cols[1],
         min_value=0.0,
         max_value=200.0,
-        value=float(st.session_state["gate_fee"]),
         step=1.0,
+        edit_enabled=commercial_edit,
     )
-    st.session_state["heat_price"] = comm_cols[2].number_input(
+    _number_input_control(
         "Heat price (USD/MWh)",
+        "heat_price",
+        container=comm_cols[2],
         min_value=0.0,
         max_value=200.0,
-        value=float(st.session_state["heat_price"]),
         step=1.0,
+        edit_enabled=commercial_edit,
     )
 
     comm_cols2 = st.columns(3)
-    st.session_state["metal_recovery"] = comm_cols2[0].number_input(
+    _number_input_control(
         "Metal recovery (USD/t)",
+        "metal_recovery",
+        container=comm_cols2[0],
         min_value=0.0,
         max_value=200.0,
-        value=float(st.session_state["metal_recovery"]),
         step=1.0,
+        edit_enabled=commercial_edit,
     )
-    st.session_state["ash_revenue"] = comm_cols2[1].number_input(
+    _number_input_control(
         "Ash revenue (USD/t)",
+        "ash_revenue",
+        container=comm_cols2[1],
         min_value=0.0,
         max_value=200.0,
-        value=float(st.session_state["ash_revenue"]),
         step=1.0,
+        edit_enabled=commercial_edit,
     )
-    st.session_state["ppa_escalation"] = comm_cols2[2].number_input(
+    _number_input_control(
         "PPA escalation (pa)",
+        "ppa_escalation",
+        container=comm_cols2[2],
         min_value=0.0,
         max_value=0.15,
-        value=float(st.session_state["ppa_escalation"]),
         step=0.005,
+        edit_enabled=commercial_edit,
     )
 
     comm_cols3 = st.columns(2)
-    st.session_state["gate_fee_escalation"] = comm_cols3[0].number_input(
+    _number_input_control(
         "Gate fee escalation (pa)",
+        "gate_fee_escalation",
+        container=comm_cols3[0],
         min_value=0.0,
         max_value=0.15,
-        value=float(st.session_state["gate_fee_escalation"]),
         step=0.005,
+        edit_enabled=commercial_edit,
     )
-    st.session_state["other_escalation"] = comm_cols3[1].number_input(
+    _number_input_control(
         "By-product escalation (pa)",
+        "other_escalation",
+        container=comm_cols3[1],
         min_value=0.0,
         max_value=0.15,
-        value=float(st.session_state["other_escalation"]),
         step=0.005,
+        edit_enabled=commercial_edit,
     )
 
 
 with page_tabs[2]:
-    st.subheader("Direct Costs (Monthly)")
+    direct_cost_edit = _section_header("Direct Costs (Monthly)", "direct_costs_monthly")
     direct_costs_monthly = _editable_table(
         "direct_costs_monthly",
         direct_costs_monthly_defaults,
@@ -939,9 +1062,10 @@ with page_tabs[2]:
             "Feedstock cost": st.column_config.NumberColumn("Feedstock cost", format="%0.0f"),
             "Residue disposal": st.column_config.NumberColumn("Residue disposal", format="%0.0f"),
         },
+        edit_enabled=direct_cost_edit,
     )
 
-    st.subheader("Staff Costs (Monthly)")
+    staff_edit = _section_header("Staff Costs (Monthly)", "staff_monthly")
     staff_monthly = _editable_table(
         "staff_monthly",
         staff_monthly_defaults,
@@ -949,9 +1073,10 @@ with page_tabs[2]:
             "Role": st.column_config.TextColumn("Role"),
             "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
         },
+        edit_enabled=staff_edit,
     )
 
-    st.subheader("Other Opex (Monthly)")
+    other_opex_edit = _section_header("Other Opex (Monthly)", "other_opex_monthly")
     other_opex_monthly = _editable_table(
         "other_opex_monthly",
         other_opex_monthly_defaults,
@@ -959,11 +1084,13 @@ with page_tabs[2]:
             "Category": st.column_config.TextColumn("Category"),
             "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
         },
+        edit_enabled=other_opex_edit,
     )
 
     st.subheader("Working Capital Inputs")
     col_wc1, col_wc2 = st.columns(2)
     with col_wc1:
+        receivable_edit = _section_header("Accounts receivable", "accounts_receivable", level="markdown")
         accounts_receivable = _editable_table(
             "accounts_receivable",
             accounts_receivable_defaults,
@@ -971,8 +1098,10 @@ with page_tabs[2]:
                 "Metric": st.column_config.TextColumn("Metric"),
                 "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
             },
+            edit_enabled=receivable_edit,
         )
     with col_wc2:
+        payable_edit = _section_header("Inventory & payables", "inventory_payable", level="markdown")
         inventory_payable = _editable_table(
             "inventory_payable",
             inventory_payable_defaults,
@@ -980,144 +1109,176 @@ with page_tabs[2]:
                 "Metric": st.column_config.TextColumn("Metric"),
                 "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
             },
+            edit_enabled=payable_edit,
         )
 
-    st.subheader("Cost Structure Controls")
+    cost_edit = _section_header("Cost Structure Controls", "cost_structure")
     cost_cols = st.columns(3)
-    st.session_state["capex_total"] = cost_cols[0].number_input(
+    _number_input_control(
         "Total CAPEX (USD)",
+        "capex_total",
+        container=cost_cols[0],
         min_value=50_000_000.0,
         max_value=600_000_000.0,
-        value=float(st.session_state["capex_total"]),
         step=5_000_000.0,
+        edit_enabled=cost_edit,
     )
-    st.session_state["fixed_om"] = cost_cols[1].number_input(
+    _number_input_control(
         "Fixed O&M (USD/a)",
+        "fixed_om",
+        container=cost_cols[1],
         min_value=0.0,
         max_value=80_000_000.0,
-        value=float(st.session_state["fixed_om"]),
         step=500_000.0,
+        edit_enabled=cost_edit,
     )
-    st.session_state["variable_om"] = cost_cols[2].number_input(
+    _number_input_control(
         "Variable O&M (USD/t)",
+        "variable_om",
+        container=cost_cols[2],
         min_value=0.0,
         max_value=250.0,
-        value=float(st.session_state["variable_om"]),
         step=1.0,
+        edit_enabled=cost_edit,
     )
 
     cost_cols2 = st.columns(3)
-    st.session_state["landfill_disposal"] = cost_cols2[0].number_input(
+    _number_input_control(
         "Residue disposal (USD/t)",
+        "landfill_disposal",
+        container=cost_cols2[0],
         min_value=0.0,
         max_value=200.0,
-        value=float(st.session_state["landfill_disposal"]),
         step=1.0,
+        edit_enabled=cost_edit,
     )
-    st.session_state["insurance_pct"] = cost_cols2[1].number_input(
+    _number_input_control(
         "Insurance (% of CAPEX/a)",
+        "insurance_pct",
+        container=cost_cols2[1],
         min_value=0.0,
         max_value=0.05,
-        value=float(st.session_state["insurance_pct"]),
         step=0.001,
+        edit_enabled=cost_edit,
     )
-    st.session_state["maintenance_pct"] = cost_cols2[2].number_input(
+    _number_input_control(
         "Maintenance (% of CAPEX/a)",
+        "maintenance_pct",
+        container=cost_cols2[2],
         min_value=0.0,
         max_value=0.1,
-        value=float(st.session_state["maintenance_pct"]),
         step=0.001,
+        edit_enabled=cost_edit,
     )
 
-    st.session_state["opex_escalation"] = st.number_input(
+    _number_input_control(
         "Opex escalation (pa)",
+        "opex_escalation",
         min_value=0.0,
         max_value=0.15,
-        value=float(st.session_state["opex_escalation"]),
         step=0.005,
+        edit_enabled=cost_edit,
     )
 
-    st.session_state["capex_profile_text"] = st.text_area(
+    _text_area_control(
         "Capex spend profile (comma separated)",
-        value=st.session_state["capex_profile_text"],
+        "capex_profile_text",
         help="Enter fractions that sum to 1 over the construction periods. Leave blank for an even spread.",
+        edit_enabled=cost_edit,
     )
 
 
 
 with page_tabs[3]:
-    st.subheader("Financing Structure")
+    finance_edit = _section_header("Financing Structure", "financing_structure")
     finance_cols = st.columns(3)
-    st.session_state["debt_ratio"] = finance_cols[0].number_input(
+    _number_input_control(
         "Debt ratio",
+        "debt_ratio",
+        container=finance_cols[0],
         min_value=0.0,
         max_value=1.0,
-        value=float(st.session_state["debt_ratio"]),
         step=0.05,
+        edit_enabled=finance_edit,
     )
-    st.session_state["interest_rate"] = finance_cols[1].number_input(
+    _number_input_control(
         "Interest rate (pa)",
+        "interest_rate",
+        container=finance_cols[1],
         min_value=0.0,
         max_value=0.25,
-        value=float(st.session_state["interest_rate"]),
         step=0.005,
+        edit_enabled=finance_edit,
     )
-    st.session_state["upfront_fee_pct"] = finance_cols[2].number_input(
+    _number_input_control(
         "Upfront fee",
+        "upfront_fee_pct",
+        container=finance_cols[2],
         min_value=0.0,
         max_value=0.05,
-        value=float(st.session_state["upfront_fee_pct"]),
         step=0.001,
+        edit_enabled=finance_edit,
     )
 
     finance_cols2 = st.columns(3)
-    st.session_state["tenor_years"] = finance_cols2[0].number_input(
+    _number_input_control(
         "Debt tenor (years)",
+        "tenor_years",
+        container=finance_cols2[0],
         min_value=1,
         max_value=30,
-        value=int(st.session_state["tenor_years"]),
         step=1,
+        edit_enabled=finance_edit,
     )
-    st.session_state["grace_years"] = finance_cols2[1].number_input(
+    _number_input_control(
         "Grace period (years)",
+        "grace_years",
+        container=finance_cols2[1],
         min_value=0,
         max_value=10,
-        value=int(st.session_state["grace_years"]),
         step=1,
+        edit_enabled=finance_edit,
     )
-    st.session_state["discount_rate"] = finance_cols2[2].number_input(
+    _number_input_control(
         "Discount rate (pa)",
+        "discount_rate",
+        container=finance_cols2[2],
         min_value=0.0,
         max_value=0.30,
-        value=float(st.session_state["discount_rate"]),
         step=0.01,
+        edit_enabled=finance_edit,
     )
 
     finance_cols3 = st.columns(2)
-    st.session_state["tax_rate"] = finance_cols3[0].number_input(
+    _number_input_control(
         "Corporate tax rate",
+        "tax_rate",
+        container=finance_cols3[0],
         min_value=0.0,
         max_value=0.5,
-        value=float(st.session_state["tax_rate"]),
         step=0.01,
+        edit_enabled=finance_edit,
     )
-    st.session_state["working_cap_days"] = finance_cols3[1].number_input(
+    _number_input_control(
         "Working capital days",
+        "working_cap_days",
+        container=finance_cols3[1],
         min_value=0,
         max_value=180,
-        value=int(st.session_state["working_cap_days"]),
         step=5,
+        edit_enabled=finance_edit,
     )
 
-    st.session_state["depr_years"] = st.number_input(
+    _number_input_control(
         "Depreciation period (years)",
+        "depr_years",
         min_value=1,
         max_value=30,
-        value=int(st.session_state["depr_years"]),
         step=1,
+        edit_enabled=finance_edit,
     )
 
-    st.subheader("Loan Schedule")
+    loan_edit = _section_header("Loan Schedule", "loan_schedule")
     loan_schedule = _editable_table(
         "loan_schedule",
         loan_schedule_defaults,
@@ -1130,9 +1291,10 @@ with page_tabs[3]:
             "Duration (years)": st.column_config.NumberColumn("Duration (years)", step=1),
             "Grace (years)": st.column_config.NumberColumn("Grace (years)", step=1),
         },
+        edit_enabled=loan_edit,
     )
 
-    st.subheader("Tax Schedule")
+    tax_edit = _section_header("Tax Schedule", "tax_schedule")
     tax_schedule = _editable_table(
         "tax_schedule",
         tax_schedule_defaults,
@@ -1142,9 +1304,10 @@ with page_tabs[3]:
             "Timing adjustment (months)": st.column_config.NumberColumn("Timing adjustment (months)", step=1),
             "Notes": st.column_config.TextColumn("Notes"),
         },
+        edit_enabled=tax_edit,
     )
 
-    st.subheader("Inflation Schedule")
+    inflation_edit = _section_header("Inflation Schedule", "inflation_schedule")
     inflation_schedule = _editable_table(
         "inflation_schedule",
         inflation_schedule_defaults,
@@ -1152,9 +1315,10 @@ with page_tabs[3]:
             "Category": st.column_config.TextColumn("Category"),
             "Inflation rate (%)": st.column_config.NumberColumn("Inflation rate (%)", format="%0.2f"),
         },
+        edit_enabled=inflation_edit,
     )
 
-    st.subheader("Risk Schedule")
+    risk_edit = _section_header("Risk Schedule", "risk_schedule")
     risk_schedule = _editable_table(
         "risk_schedule",
         risk_schedule_defaults,
@@ -1164,6 +1328,7 @@ with page_tabs[3]:
             "Impact (USD)": st.column_config.NumberColumn("Impact (USD)", format="%0.0f"),
             "Mitigation": st.column_config.TextColumn("Mitigation"),
         },
+        edit_enabled=risk_edit,
     )
 
 
@@ -1562,7 +1727,7 @@ with page_tabs[7]:
 
 
 with page_tabs[8]:
-    st.subheader("Sensitivity Analysis Configuration")
+    sensitivity_edit = _section_header("Sensitivity Analysis Configuration", "sensitivity_config")
     sensitivity_config = _editable_table(
         "sensitivity_config",
         sensitivity_config_defaults,
@@ -1572,6 +1737,7 @@ with page_tabs[8]:
             "Base": st.column_config.NumberColumn("Base", format="%0.2f"),
             "High": st.column_config.NumberColumn("High", format="%0.2f"),
         },
+        edit_enabled=sensitivity_edit,
     )
 
     st.subheader("Simulation Results")
@@ -1595,7 +1761,7 @@ with page_tabs[8]:
     sensitivity_results = pd.DataFrame(simulated)
     st.dataframe(sensitivity_results.round(4), use_container_width=True)
 
-    st.subheader("Monte Carlo Simulation Configuration")
+    monte_edit = _section_header("Monte Carlo Simulation Configuration", "monte_carlo_config")
     monte_carlo_defaults_runtime = pd.DataFrame(
         [
             {
@@ -1621,6 +1787,7 @@ with page_tabs[8]:
             "Mean": st.column_config.NumberColumn("Mean", format="%0.2f"),
             "Std dev": st.column_config.NumberColumn("Std dev", format="%0.2f"),
         },
+        edit_enabled=monte_edit,
     )
     if not monte_carlo_config.empty:
         st.write(
@@ -1630,7 +1797,7 @@ with page_tabs[8]:
 
 
 with page_tabs[9]:
-    st.subheader("Goal Seek Configuration")
+    goal_edit = _section_header("Goal Seek Configuration", "goal_seek")
     goal_seek = _editable_table(
         "goal_seek",
         goal_seek_defaults,
@@ -1639,6 +1806,7 @@ with page_tabs[9]:
             "Target value": st.column_config.NumberColumn("Target value", format="%0.2f"),
             "Variable": st.column_config.TextColumn("Variable"),
         },
+        edit_enabled=goal_edit,
     )
 
     st.subheader("Goal Seek Results")
@@ -1669,7 +1837,7 @@ with page_tabs[9]:
             )
         st.dataframe(pd.DataFrame(results_rows).round(4), use_container_width=True)
 
-    st.subheader("Scenario / Is Configuration")
+    scenario_edit = _section_header("Scenario / Is Configuration", "scenario_config")
     scenario_config = _editable_table(
         "scenario_config",
         scenario_config_defaults,
@@ -1679,6 +1847,7 @@ with page_tabs[9]:
             "Gate fee adjustment": st.column_config.NumberColumn("Gate fee adjustment", format="%0.2f"),
             "CAPEX adjustment": st.column_config.NumberColumn("CAPEX adjustment", format="%0.2f"),
         },
+        edit_enabled=scenario_edit,
     )
 
     st.subheader("Scenario Tool Configuration")
@@ -1713,7 +1882,7 @@ with page_tabs[9]:
 
 
 with page_tabs[10]:
-    st.subheader("Break-Even Analysis Inputs")
+    break_even_edit = _section_header("Break-Even Analysis Inputs", "break_even_inputs")
     break_even_inputs = _editable_table(
         "break_even_inputs",
         break_even_defaults,
@@ -1721,6 +1890,7 @@ with page_tabs[10]:
             "Input": st.column_config.TextColumn("Input"),
             "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
         },
+        edit_enabled=break_even_edit,
     )
 
     st.subheader("Break-Even Results Background")
@@ -1729,7 +1899,7 @@ with page_tabs[10]:
     st.metric("Breakeven revenue", f"${break_even_revenue:,.0f}")
     st.metric("Breakeven cost base", f"${break_even_costs:,.0f}")
 
-    st.subheader("Key Parameter Naming")
+    parameter_edit = _section_header("Key Parameter Naming", "parameter_naming")
     parameter_naming = _editable_table(
         "parameter_naming",
         parameter_naming_defaults,
@@ -1737,6 +1907,7 @@ with page_tabs[10]:
             "Parameter": st.column_config.TextColumn("Parameter"),
             "Preferred name": st.column_config.TextColumn("Preferred name"),
         },
+        edit_enabled=parameter_edit,
     )
     st.dataframe(parameter_naming, use_container_width=True)
 
