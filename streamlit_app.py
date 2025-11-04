@@ -891,6 +891,16 @@ projection = ProjectionSettings(
 
 capex_profile = _parse_capex_profile(st.session_state["capex_profile_text"], inputs.costs.capex_spend_profile)
 
+revenue_inputs = RevenueAssumptions()
+revenue_inputs.ppa_price_usd_per_mwh = float(st.session_state["ppa_price"])
+revenue_inputs.ppa_escalation = float(st.session_state["ppa_escalation"])
+revenue_inputs.gate_fee_usd_per_t = float(st.session_state["gate_fee"])
+revenue_inputs.gate_fee_escalation = float(st.session_state["gate_fee_escalation"])
+revenue_inputs.heat_price_usd_per_mwh = float(st.session_state["heat_price"])
+revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery"])
+revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
+revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
+
 user_inputs = WTEMasterInputs(
     timeline=Timeline(
         years=projection.years,
@@ -906,16 +916,7 @@ user_inputs = WTEMasterInputs(
         availability=float(st.session_state["availability"]),
         parasitic_load_frac=float(st.session_state["parasitic_load"]),
     ),
-    revenue=RevenueAssumptions(
-        ppa_price_usd_per_mwh=float(st.session_state["ppa_price"]),
-        gate_fee_usd_per_t=float(st.session_state["gate_fee"]),
-        heat_price_usd_per_mwh=float(st.session_state["heat_price"]),
-        metal_recovery_usd_per_t=float(st.session_state["metal_recovery"]),
-        ash_revenue_usd_per_t=float(st.session_state["ash_revenue"]),
-        ppa_escalation=float(st.session_state["ppa_escalation"]),
-        gate_fee_escalation=float(st.session_state["gate_fee_escalation"]),
-        other_escalation=float(st.session_state["other_escalation"]),
-    ),
+    revenue=revenue_inputs,
     costs=CostAssumptions(
         capex_total_usd=float(st.session_state["capex_total"]),
         capex_spend_profile=capex_profile,
