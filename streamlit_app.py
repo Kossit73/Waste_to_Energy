@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pandas.api.types import is_numeric_dtype
 
 from wte_model import (
     CostAssumptions,
@@ -62,10 +63,25 @@ def _parse_capex_profile(text: str, fallback: Optional[List[float]]) -> Optional
     return values
 
 
+def _update_table_state(key: str, df: pd.DataFrame) -> None:
+    st.session_state[key] = df.copy()
+    st.session_state[f"editor_{key}"] = df.copy()
+
+
 def _ensure_state_df(key: str, data: pd.DataFrame) -> pd.DataFrame:
     if key not in st.session_state:
-        st.session_state[key] = data
+        _update_table_state(key, data)
     return st.session_state[key]
+
+
+def _blank_row(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    row = {}
+    for col in df.columns:
+        series = df[col]
+        row[col] = 0.0 if is_numeric_dtype(series) else ""
+    return pd.DataFrame([row])
 
 
 def _editable_table(
@@ -73,8 +89,39 @@ def _editable_table(
     data: pd.DataFrame,
     *,
     column_config: Optional[Dict[str, st.column_config.BaseColumn]] = None,
+    allow_row_controls: bool = True,
+    new_row_factory: Optional[Callable[[], pd.DataFrame]] = None,
 ) -> pd.DataFrame:
-    base = _ensure_state_df(key, data)
+    base = _ensure_state_df(key, data.copy())
+
+    if allow_row_controls:
+        ctrl_cols = st.columns(2)
+        with ctrl_cols[0]:
+            if st.button("Add row", key=f"add_{key}"):
+                template = base if not base.empty else data
+                new_row_df = new_row_factory() if new_row_factory else None
+                if new_row_df is None or new_row_df.empty:
+                    new_row_df = _blank_row(template)
+                if new_row_df is not None:
+                    combined = pd.concat([base, new_row_df], ignore_index=True)
+                    _update_table_state(key, combined)
+                    st.experimental_rerun()
+        with ctrl_cols[1]:
+            if base.empty:
+                st.write("No rows to remove")
+            else:
+                idx_options = list(range(len(base)))
+                remove_idx = st.selectbox(
+                    "Row to remove",
+                    idx_options,
+                    format_func=lambda i: f"Row {i + 1}",
+                    key=f"remove_idx_{key}",
+                )
+                if st.button("Remove row", key=f"remove_{key}"):
+                    trimmed = base.drop(base.index[remove_idx]).reset_index(drop=True)
+                    _update_table_state(key, trimmed)
+                    st.experimental_rerun()
+
     edited = st.data_editor(
         base,
         key=f"editor_{key}",
@@ -82,8 +129,22 @@ def _editable_table(
         use_container_width=True,
         column_config=column_config or {},
     )
-    st.session_state[key] = edited
+    _update_table_state(key, edited)
     return edited
+
+
+def _reset_scalar_values(values: Dict[str, Any]) -> None:
+    for key, value in values.items():
+        st.session_state[key] = value
+
+
+def _reset_table_group(defaults: Dict[str, pd.DataFrame], *, mode: str) -> None:
+    for key, df in defaults.items():
+        if mode == "defaults":
+            _update_table_state(key, df.copy())
+        elif mode == "clean":
+            empty_df = pd.DataFrame(columns=df.columns)
+            _update_table_state(key, empty_df)
 
 
 def _compute_initial_investment_schedule(df: pd.DataFrame) -> pd.DataFrame:
@@ -200,10 +261,12 @@ _set_default("gate_fee_escalation", float(inputs.revenue.gate_fee_escalation))
 _set_default("other_escalation", float(inputs.revenue.other_escalation))
 
 _set_default("capex_total", float(inputs.costs.capex_total_usd))
-_set_default(
-    "capex_profile_text",
-    ", ".join(f"{v:.3f}" for v in inputs.costs.capex_spend_profile) if inputs.costs.capex_spend_profile else "",
+capex_profile_default_text = (
+    ", ".join(f"{v:.3f}" for v in inputs.costs.capex_spend_profile)
+    if inputs.costs.capex_spend_profile
+    else ""
 )
+_set_default("capex_profile_text", capex_profile_default_text)
 _set_default("fixed_om", float(inputs.costs.fixed_om_usd_pa))
 _set_default("variable_om", float(inputs.costs.variable_om_usd_per_t))
 _set_default("landfill_disposal", float(inputs.costs.landfill_disposal_usd_per_t))
@@ -391,6 +454,23 @@ goal_seek_defaults = pd.DataFrame(
     ]
 )
 
+monte_carlo_defaults = pd.DataFrame(
+    [
+        {
+            "Variable": "PPA price",
+            "Distribution": "Normal",
+            "Mean": inputs.revenue.ppa_price_usd_per_mwh,
+            "Std dev": inputs.revenue.ppa_price_usd_per_mwh * 0.05,
+        },
+        {
+            "Variable": "CAPEX",
+            "Distribution": "Triangular",
+            "Mean": inputs.costs.capex_total_usd,
+            "Std dev": inputs.costs.capex_total_usd * 0.08,
+        },
+    ]
+)
+
 break_even_defaults = pd.DataFrame(
     [
         {"Input": "CAPEX", "Value": inputs.costs.capex_total_usd},
@@ -424,6 +504,133 @@ parameter_naming_defaults = pd.DataFrame(
 
 
 
+
+
+TABLE_LABELS: Dict[str, str] = {
+    "global_inputs": "Global inputs",
+    "initial_investment": "Initial investment",
+    "revenue_inputs": "Revenue inputs",
+    "production_annual": "Production annual",
+    "production_monthly": "Production monthly",
+    "direct_costs_monthly": "Direct costs monthly",
+    "staff_monthly": "Staff monthly",
+    "other_opex_monthly": "Other opex monthly",
+    "accounts_receivable": "Accounts receivable",
+    "inventory_payable": "Inventory & payables",
+    "loan_schedule": "Loan schedule",
+    "tax_schedule": "Tax schedule",
+    "inflation_schedule": "Inflation schedule",
+    "risk_schedule": "Risk schedule",
+    "sensitivity_config": "Sensitivity configuration",
+    "monte_carlo_config": "Monte Carlo configuration",
+    "goal_seek": "Goal seek",
+    "scenario_config": "Scenario configuration",
+    "break_even_inputs": "Break-even inputs",
+    "parameter_naming": "Parameter naming",
+}
+
+
+TABLE_DEFAULTS: Dict[str, pd.DataFrame] = {
+    key: df for key, df in [
+        ("global_inputs", global_defaults),
+        ("initial_investment", initial_investment_defaults),
+        ("revenue_inputs", revenue_defaults),
+        ("production_annual", production_annual_defaults),
+        ("production_monthly", production_monthly_defaults),
+        ("direct_costs_monthly", direct_costs_monthly_defaults),
+        ("staff_monthly", staff_monthly_defaults),
+        ("other_opex_monthly", other_opex_monthly_defaults),
+        ("accounts_receivable", accounts_receivable_defaults),
+        ("inventory_payable", inventory_payable_defaults),
+        ("loan_schedule", loan_schedule_defaults),
+        ("tax_schedule", tax_schedule_defaults),
+        ("inflation_schedule", inflation_schedule_defaults),
+        ("risk_schedule", risk_schedule_defaults),
+        ("sensitivity_config", sensitivity_config_defaults),
+        ("monte_carlo_config", monte_carlo_defaults),
+        ("goal_seek", goal_seek_defaults),
+        ("scenario_config", scenario_config_defaults),
+        ("break_even_inputs", break_even_defaults),
+        ("parameter_naming", parameter_naming_defaults),
+    ]
+}
+
+
+SCALAR_DEFAULTS: Dict[str, Any] = {
+    "projection_start_year": projection_defaults.start_year,
+    "projection_end_year": projection_defaults.end_year,
+    "projection_ppy": projection_defaults.periods_per_year,
+    "msw_tonnes_pa": float(inputs.tech.msw_tonnes_pa),
+    "lhv_mj_per_kg": float(inputs.tech.lhv_mj_per_kg),
+    "boiler_efficiency": float(inputs.tech.boiler_efficiency),
+    "electrical_efficiency": float(inputs.tech.electrical_efficiency),
+    "availability": float(inputs.tech.availability),
+    "parasitic_load": float(inputs.tech.parasitic_load_frac),
+    "ppa_price": float(inputs.revenue.ppa_price_usd_per_mwh),
+    "gate_fee": float(inputs.revenue.gate_fee_usd_per_t),
+    "heat_price": float(inputs.revenue.heat_price_usd_per_mwh),
+    "metal_recovery": float(inputs.revenue.metal_recovery_usd_per_t),
+    "ash_revenue": float(inputs.revenue.ash_revenue_usd_per_t),
+    "ppa_escalation": float(inputs.revenue.ppa_escalation),
+    "gate_fee_escalation": float(inputs.revenue.gate_fee_escalation),
+    "other_escalation": float(inputs.revenue.other_escalation),
+    "capex_total": float(inputs.costs.capex_total_usd),
+    "capex_profile_text": capex_profile_default_text,
+    "fixed_om": float(inputs.costs.fixed_om_usd_pa),
+    "variable_om": float(inputs.costs.variable_om_usd_per_t),
+    "landfill_disposal": float(inputs.costs.landfill_disposal_usd_per_t),
+    "insurance_pct": float(inputs.costs.insurance_pct_of_capex_pa),
+    "maintenance_pct": float(inputs.costs.maintenance_pct_of_capex_pa),
+    "opex_escalation": float(inputs.costs.opex_escalation),
+    "debt_ratio": float(inputs.finance.debt_ratio),
+    "interest_rate": float(inputs.finance.interest_rate),
+    "tenor_years": int(inputs.finance.tenor_years),
+    "grace_years": int(inputs.finance.grace_years),
+    "upfront_fee_pct": float(inputs.finance.upfront_fee_pct),
+    "tax_rate": float(inputs.finance.tax_rate),
+    "depr_years": int(inputs.finance.depr_years),
+    "working_cap_days": int(inputs.finance.working_cap_days),
+    "discount_rate": float(inputs.finance.discount_rate),
+}
+
+
+SCALAR_CLEAN_START: Dict[str, Any] = {
+    "projection_start_year": projection_defaults.start_year,
+    "projection_end_year": projection_defaults.start_year + 4,
+    "projection_ppy": max(1, projection_defaults.periods_per_year),
+    "msw_tonnes_pa": 10_000.0,
+    "lhv_mj_per_kg": 4.0,
+    "boiler_efficiency": 0.3,
+    "electrical_efficiency": 0.1,
+    "availability": 0.5,
+    "parasitic_load": 0.0,
+    "ppa_price": 0.0,
+    "gate_fee": 0.0,
+    "heat_price": 0.0,
+    "metal_recovery": 0.0,
+    "ash_revenue": 0.0,
+    "ppa_escalation": 0.0,
+    "gate_fee_escalation": 0.0,
+    "other_escalation": 0.0,
+    "capex_total": 50_000_000.0,
+    "capex_profile_text": "",
+    "fixed_om": 0.0,
+    "variable_om": 0.0,
+    "landfill_disposal": 0.0,
+    "insurance_pct": 0.0,
+    "maintenance_pct": 0.0,
+    "opex_escalation": 0.0,
+    "debt_ratio": 0.0,
+    "interest_rate": 0.0,
+    "tenor_years": 1,
+    "grace_years": 0,
+    "upfront_fee_pct": 0.0,
+    "tax_rate": 0.0,
+    "depr_years": 1,
+    "working_cap_days": 0,
+    "discount_rate": 0.0,
+}
+
 page_tabs = st.tabs(
     [
         "Input Landing",
@@ -442,6 +649,84 @@ page_tabs = st.tabs(
 
 
 with page_tabs[0]:
+    with st.expander("Manage defaults & state", expanded=False):
+        col_md1, col_md2, col_md3 = st.columns(3)
+        if col_md1.button("Restore defaults", key="restore_defaults"):
+            _reset_scalar_values(SCALAR_DEFAULTS)
+            _reset_table_group(TABLE_DEFAULTS, mode="defaults")
+            st.success("Defaults restored.")
+            st.experimental_rerun()
+        if col_md2.button("Clean start", key="clean_start"):
+            _reset_scalar_values(SCALAR_CLEAN_START)
+            _reset_table_group(TABLE_DEFAULTS, mode="clean")
+            st.success("Workspace cleared.")
+            st.experimental_rerun()
+        if col_md3.button("Save current as custom", key="save_custom_defaults"):
+            st.session_state["custom_scalar_defaults"] = {
+                key: st.session_state.get(key, value) for key, value in SCALAR_DEFAULTS.items()
+            }
+            st.session_state["custom_table_defaults"] = {
+                key: _ensure_state_df(key, df.copy()).copy() for key, df in TABLE_DEFAULTS.items()
+            }
+            st.success("Saved current assumptions as custom defaults.")
+        if st.session_state.get("custom_scalar_defaults"):
+            if st.button("Load custom defaults", key="load_custom_defaults"):
+                _reset_scalar_values(st.session_state["custom_scalar_defaults"])
+                for key, df in st.session_state.get("custom_table_defaults", {}).items():
+                    _update_table_state(key, df)
+                st.success("Loaded custom defaults.")
+                st.experimental_rerun()
+
+    with st.expander("Yearly increment helper", expanded=False):
+        available_tables = {
+            key: _ensure_state_df(key, df.copy()) for key, df in TABLE_DEFAULTS.items()
+        }
+        options = [
+            key for key, df in available_tables.items()
+            if not df.empty and any(is_numeric_dtype(df[col]) for col in df.columns)
+        ]
+        if not options:
+            st.info("Add rows to a table to enable yearly increments.")
+        else:
+            table_key = st.selectbox(
+                "Table",
+                options,
+                format_func=lambda k: TABLE_LABELS.get(k, k.replace("_", " ").title()),
+                key="increment_table_select",
+            )
+            table_df = available_tables[table_key].copy()
+            numeric_cols = [col for col in table_df.columns if is_numeric_dtype(table_df[col])]
+            column = st.selectbox(
+                "Column",
+                numeric_cols,
+                key=f"increment_column_{table_key}",
+            )
+            default_base = float(table_df[column].fillna(0.0).iloc[0]) if not table_df.empty else 0.0
+            base_value = st.number_input(
+                "Base value",
+                value=float(default_base),
+                key=f"increment_base_{table_key}",
+            )
+            increment_pct = st.number_input(
+                "Annual increment (%)",
+                value=0.0,
+                step=0.5,
+                key=f"increment_pct_{table_key}",
+            )
+            if st.button("Apply increment", key=f"apply_increment_{table_key}"):
+                if table_df.empty:
+                    st.warning("Table has no rows to update.")
+                else:
+                    growth = [(1 + increment_pct / 100.0) ** i for i in range(len(table_df))]
+                    updated = table_df.copy()
+                    updated[column] = [base_value * g for g in growth]
+                    _update_table_state(table_key, updated)
+                    st.success(
+                        f"Applied {increment_pct:.2f}% annual increment to "
+                        f"{TABLE_LABELS.get(table_key, column)}"
+                    )
+                    st.experimental_rerun()
+
     st.subheader("Projection Horizon")
     col_proj1, col_proj2, col_proj3 = st.columns(3)
     start_year = col_proj1.number_input(
@@ -1312,7 +1597,7 @@ with page_tabs[8]:
     st.dataframe(sensitivity_results.round(4), use_container_width=True)
 
     st.subheader("Monte Carlo Simulation Configuration")
-    monte_carlo_defaults = pd.DataFrame(
+    monte_carlo_defaults_runtime = pd.DataFrame(
         [
             {
                 "Variable": "PPA price",
@@ -1330,7 +1615,7 @@ with page_tabs[8]:
     )
     monte_carlo_config = _editable_table(
         "monte_carlo_config",
-        monte_carlo_defaults,
+        monte_carlo_defaults_runtime,
         column_config={
             "Variable": st.column_config.TextColumn("Variable"),
             "Distribution": st.column_config.TextColumn("Distribution"),
