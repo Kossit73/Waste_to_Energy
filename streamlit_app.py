@@ -65,7 +65,6 @@ def _parse_capex_profile(text: str, fallback: Optional[List[float]]) -> Optional
 
 def _update_table_state(key: str, df: pd.DataFrame) -> None:
     st.session_state[key] = df.copy()
-    st.session_state[f"editor_{key}"] = df.copy()
 
 
 def _ensure_state_df(key: str, data: pd.DataFrame) -> pd.DataFrame:
