@@ -1466,12 +1466,6 @@ st.download_button(
     mime="text/csv",
 )
 
-if uploaded_workbook is not None:
-    mapped = getattr(WTEMasterInputs, "_MAPPED_DEBUG", None)
-    if mapped:
-        with st.expander("Excel named-range mapping"):
-            st.json(mapped)
-
 st.info(
     "All navigation is organised horizontally across the page. Use the tabs to explore inputs, "
     "results, sensitivities, and scenario tools without relying on a sidebar."
