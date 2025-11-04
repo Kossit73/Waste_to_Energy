@@ -943,6 +943,14 @@ user_inputs = WTEMasterInputs(
 
 results = cashflow_model(user_inputs)
 
+energy = results["energy"]
+revenue = results["rev"]
+capex_total = results["capex"]["total"]
+opex_total = results["opex"]["total_opex"]
+tax_cash = results["tax"]["cash_tax"]
+depr_total = results["depr"]["total"]
+debt = results["debt"]
+
 periods = np.arange(user_inputs.timeline.n)
 years_axis = user_inputs.timeline.start_year + (periods // user_inputs.timeline.periods_per_year)
 
@@ -950,17 +958,17 @@ summary = pd.DataFrame(
     {
         "Period": periods + 1,
         "Calendar Year": years_axis,
-        "Tonnes": results["energy"]["tonnes"],
-        "Net MWh": results["energy"]["net_mwh"],
-        "Total revenue": results["rev"]["total_revenue"],
-        "Total opex": results["opex"]["total_opex"],
+        "Tonnes": energy["tonnes"],
+        "Net MWh": energy["net_mwh"],
+        "Total revenue": revenue["total_revenue"],
+        "Total opex": opex_total,
         "EBITDA": results["ebitda"],
         "CFADS": results["cfads"],
-        "Debt service": results["debt"]["debt_service"],
+        "Debt service": debt["debt_service"],
         "Equity cash flow": results["equity_cf"],
-        "Capex": results["capex"],
-        "Debt balance": results["debt"]["balance"],
-        "Tax": results["tax"],
+        "Capex": capex_total,
+        "Debt balance": debt["balance"],
+        "Tax": tax_cash,
     }
 )
 
@@ -993,15 +1001,13 @@ owner_cf = equity_cf * owner_share_pct / 100.0
 investor_irr = _irr(investor_cf)
 owner_irr = _irr(owner_cf)
 
-project_cashflows = -results["capex"] + (
-    results["rev"]["total_revenue"] - results["opex"]["total_opex"] - results["tax"]
-)
+project_cashflows = -capex_total + (revenue["total_revenue"] - opex_total - tax_cash)
 project_npv = _npv(user_inputs.finance.discount_rate, project_cashflows)
 
-annual_revenue = _annualise(results["rev"]["total_revenue"], user_inputs.timeline.periods_per_year)
+annual_revenue = _annualise(revenue["total_revenue"], user_inputs.timeline.periods_per_year)
 annual_ebitda = _annualise(results["ebitda"], user_inputs.timeline.periods_per_year)
 annual_equity_cf = _annualise(results["equity_cf"], user_inputs.timeline.periods_per_year)
-annual_capex = _annualise(results["capex"], user_inputs.timeline.periods_per_year)
+annual_capex = _annualise(capex_total, user_inputs.timeline.periods_per_year)
 
 production_annual_series = _annualise(results["energy"]["tonnes"], user_inputs.timeline.periods_per_year)
 
@@ -1123,9 +1129,9 @@ with page_tabs[4]:
         {
             "Category": ["CAPEX", "OPEX", "Debt service"],
             "Value": [
-                float(results["capex"].sum()),
+                float(capex_total.sum()),
                 float(results["opex"]["total_opex"].sum()),
-                float(results["debt"]["debt_service"].sum()),
+                float(debt["debt_service"].sum()),
             ],
         }
     )
@@ -1134,8 +1140,8 @@ with page_tabs[4]:
     st.subheader("Capital Expenditure and Debt")
     capex_debt = pd.DataFrame(
         {
-            "Capex": _annualise(results["capex"], user_inputs.timeline.periods_per_year),
-            "Debt draws": _annualise(results["debt"]["debt_draws"], user_inputs.timeline.periods_per_year),
+            "Capex": _annualise(capex_total, user_inputs.timeline.periods_per_year),
+            "Debt draws": _annualise(debt["debt_draws"], user_inputs.timeline.periods_per_year),
         }
     )
     st.bar_chart(capex_debt)
@@ -1144,7 +1150,7 @@ with page_tabs[4]:
     st.dataframe(schedule.round(2), use_container_width=True)
 
     st.subheader("Debt Schedule")
-    st.line_chart(pd.Series(results["debt"]["balance"], index=summary["Period"]))
+    st.line_chart(pd.Series(debt["balance"], index=summary["Period"]))
 
     st.subheader("Cash Flow & Returns")
     cf_returns = pd.DataFrame(
@@ -1202,9 +1208,9 @@ with page_tabs[5]:
 
 with page_tabs[6]:
     st.subheader("Monthly Statement of Financial Position")
-    net_fixed_assets = np.cumsum(results["capex"]) - np.cumsum(results["depr"])
-    debt_balance = results["debt"]["balance"]
-    equity_balance = np.cumsum(-results["capex"] + results["debt"]["debt_draws"] + results["equity_cf"])
+    net_fixed_assets = np.cumsum(capex_total) - np.cumsum(depr_total)
+    debt_balance = debt["balance"]
+    equity_balance = np.cumsum(-capex_total + debt["debt_draws"] + results["equity_cf"])
     cash_balance = np.cumsum(results["equity_cf"])
     working_capital = np.full_like(net_fixed_assets, user_inputs.finance.working_cap_days)
     balance_sheet_monthly = pd.DataFrame(
@@ -1240,9 +1246,9 @@ with page_tabs[7]:
         {
             "Period": summary["Period"],
             "Operating cash flow": summary["CFADS"],
-            "Investing cash flow": -results["capex"],
-            "Financing cash flow": results["debt"]["debt_draws"] - results["debt"]["debt_service"] + equity_cf,
-            "Net cash flow": summary["CFADS"] - results["capex"] + results["debt"]["debt_draws"] - results["debt"]["debt_service"] + equity_cf,
+            "Investing cash flow": -capex_total,
+            "Financing cash flow": debt["debt_draws"] - debt["debt_service"] + equity_cf,
+            "Net cash flow": summary["CFADS"] - capex_total + debt["debt_draws"] - debt["debt_service"] + equity_cf,
             "Cumulative equity CF": summary_cumulative["Cumulative Equity cash flow"],
         }
     )
