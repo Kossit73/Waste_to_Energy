@@ -26,7 +26,7 @@ from wte_model.io_excel import load_inputs_from_xlsm
 st.set_page_config(page_title="Waste-to-Energy Model", layout="wide")
 st.title("Waste-to-Energy Financial Model")
 st.caption(
-    "Upload an Excel workbook or fine-tune the sliders to evaluate project-level "
+    "Upload an Excel workbook or fine-tune the controls to evaluate project-level "
     "economics, debt sizing, and equity returns."
 )
 
@@ -55,21 +55,21 @@ def _parse_capex_profile(text: str, fallback: Optional[List[float]]) -> Optional
     try:
         values = [float(part.strip()) for part in text.split(",") if part.strip()]
     except ValueError:
-        st.sidebar.warning("Capex profile could not be parsed; using fallback values.")
+        st.warning("Capex profile could not be parsed; using fallback values.")
         return fallback
     if not values:
         return fallback
     total = sum(values)
     if total <= 0:
-        st.sidebar.warning("Capex profile must sum to a positive value; using fallback values.")
+        st.warning("Capex profile must sum to a positive value; using fallback values.")
         return fallback
     if abs(total - 1.0) > 1e-6:
-        st.sidebar.info("Capex profile normalised to sum to 1.0.")
+        st.info("Capex profile normalised to sum to 1.0.")
         values = [v / total for v in values]
     return values
 
 
-uploaded_workbook = st.sidebar.file_uploader(
+uploaded_workbook = st.file_uploader(
     "Upload Excel assumptions (optional)", type=["xlsm", "xlsx"], accept_multiple_files=False
 )
 
@@ -79,14 +79,16 @@ if uploaded_workbook is not None:
     try:
         inputs = _load_inputs_from_upload(uploaded_workbook)
         source_label = uploaded_workbook.name or "Uploaded workbook"
-        st.sidebar.success(f"Loaded inputs from {source_label}.")
+        st.success(f"Loaded inputs from {source_label}.")
     except Exception as exc:  # pragma: no cover - user feedback path
-        st.sidebar.error(f"Failed to read workbook: {exc}")
+        st.error(f"Failed to read workbook: {exc}")
 
-st.sidebar.caption(f"Using assumptions from: {source_label}")
+st.caption(f"Using assumptions from: {source_label}")
 
-# ---- Sidebar overrides -----------------------------------------------------
-with st.sidebar.expander("Timeline", expanded=True):
+tabs = st.tabs(["Timeline", "Technology", "Revenue", "Costs", "Finance"])
+
+with tabs[0]:
+    st.write("Configure the overall schedule and model resolution.")
     years = st.number_input("Operating years", min_value=1, max_value=60, value=inputs.timeline.years, step=1)
     build_months = st.number_input(
         "Construction months", min_value=1, max_value=120, value=inputs.timeline.build_months, step=1
@@ -98,7 +100,8 @@ with st.sidebar.expander("Timeline", expanded=True):
         "Periods per year", min_value=1, max_value=12, value=inputs.timeline.periods_per_year, step=1
     )
 
-with st.sidebar.expander("Technology", expanded=True):
+with tabs[1]:
+    st.write("Update throughput and conversion efficiencies for the facility.")
     msw_tonnes_pa = st.number_input(
         "MSW throughput (t/a)", min_value=10_000.0, max_value=1_000_000.0, value=float(inputs.tech.msw_tonnes_pa), step=10_000.0
     )
@@ -118,7 +121,8 @@ with st.sidebar.expander("Technology", expanded=True):
         "Parasitic load fraction", min_value=0.0, max_value=0.3, value=float(inputs.tech.parasitic_load_frac), step=0.01
     )
 
-with st.sidebar.expander("Revenue", expanded=False):
+with tabs[2]:
+    st.write("Set commercial terms for power, waste, and by-product revenues.")
     ppa_price = st.number_input(
         "PPA price (USD/MWh)", min_value=0.0, max_value=500.0, value=float(inputs.revenue.ppa_price_usd_per_mwh), step=1.0
     )
@@ -144,7 +148,8 @@ with st.sidebar.expander("Revenue", expanded=False):
         "By-product escalation (pa)", min_value=0.0, max_value=0.10, value=float(inputs.revenue.other_escalation), step=0.005
     )
 
-with st.sidebar.expander("Costs", expanded=False):
+with tabs[3]:
+    st.write("Adjust capital costs and operating expenditure assumptions.")
     capex_total = st.number_input(
         "Total CAPEX (USD)", min_value=50_000_000.0, max_value=600_000_000.0, value=float(inputs.costs.capex_total_usd), step=5_000_000.0
     )
@@ -172,7 +177,8 @@ with st.sidebar.expander("Costs", expanded=False):
         "Opex escalation (pa)", min_value=0.0, max_value=0.10, value=float(inputs.costs.opex_escalation), step=0.005
     )
 
-with st.sidebar.expander("Finance", expanded=False):
+with tabs[4]:
+    st.write("Define the financing structure and valuation parameters.")
     debt_ratio = st.number_input(
         "Debt ratio", min_value=0.0, max_value=1.0, value=float(inputs.finance.debt_ratio), step=0.05
     )
@@ -321,6 +327,6 @@ if uploaded_workbook is not None:
             st.json(mapped)
 
 st.info(
-    "Use the sidebar to tweak assumptions or upload an Excel workbook. "
+    "Use the tabs above to tweak assumptions or upload an Excel workbook. "
     "The results above update instantly so you can iterate on project scenarios."
 )
