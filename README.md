@@ -54,5 +54,14 @@ calculated cash-flow table at any time.
 - `streamlit_app.py` – interactive dashboard built on top of the model.
 - `run_example.py` – example entry point that ties everything together.
 
+## Key capabilities
+
+- **Operational variability** – model throughput, efficiency, and availability on a per-period basis to capture ramp-up, outages, and degradation.
+- **Flexible commercial stack** – configure multiple revenue streams with independent drivers, indexation curves, and escalation rules (power, heat, gate fees, by-products, FX-linked tariffs, etc.).
+- **Detailed capital assets** – track capex at the item level with distinct depreciation lives, bonus depreciation, and residual values for fixed-asset rollforwards.
+- **Multi-facility financing** – represent senior, mezzanine, and working-capital facilities with interest-during-construction, sculpted or annuity amortisation, cash sweeps, and LLCR/PLCR coverage metrics.
+- **Enhanced tax and working capital** – include loss carry-forwards, minimum taxes, withholding on distributions, and granular receivable/payable/inventory assumptions.
+- **Risk analytics** – run one-click sensitivities, goal seeks, and Monte Carlo simulations to understand IRR/DSCR distributions and scenario comparisons.
+
 Feel free to adapt the input mappings or extend the model logic to match your
 specific project requirements.

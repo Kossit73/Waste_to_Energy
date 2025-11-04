@@ -1,4 +1,4 @@
-"""Excel IO helpers for the waste-to-energy model."""
+"""Excel assumption loader."""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -6,22 +6,11 @@ from typing import Any, Dict, List, Optional
 from openpyxl import load_workbook
 from openpyxl.workbook.workbook import Workbook
 
-from .inputs import (
-    Timeline,
-    TechAssumptions,
-    RevenueAssumptions,
-    CostAssumptions,
-    FinanceAssumptions,
-    WTEMasterInputs,
-)
+from .inputs import WTEMasterInputs, default_inputs
 
 NAME_MAP: Dict[str, List[str]] = {
     "project_start_date": ["project_start_date", "proj_start_date", "start_date"],
-    "pre_op_months": ["pre_op_months", "preop_months", "pre_operations_months"],
-    "dev_months": ["dev_months", "development_months"],
     "build_months": ["build_months", "construction_months", "c_months"],
-    "cod_date": ["COD_date", "cod_date", "date_COD"],
-    "eoc_date": ["eoc_date", "EOC_date", "end_of_construction_date"],
     "periods_per_year": ["periods_per_year", "ppy", "model_ppy"],
     "msw_tonnes_pa": ["msw_tonnes_pa", "waste_tonnage_pa", "msw_annual_tonnage", "annual_waste_tonnes"],
     "lhv_mj_per_kg": ["LHV_MJ_per_kg", "lhv_mj_kg", "LHV", "lhv"],
@@ -29,8 +18,6 @@ NAME_MAP: Dict[str, List[str]] = {
     "electrical_efficiency": ["electrical_efficiency", "net_electrical_efficiency", "elec_eff_net", "eta_electric_net"],
     "availability": ["availability", "availability_pa", "on_stream_factor", "uptime_factor"],
     "parasitic_load_frac": ["parasitic_load_frac", "parasitic_load", "aux_power_frac", "house_load_frac"],
-    "plant_capacity_MW": ["plant_capacity_MW", "net_export_capacity_MW", "net_capacity_MW"],
-    "power_export_MWh_pa": ["power_export_MWh_pa", "annual_export_MWh"],
     "ppa_price_usd_per_mwh": ["ppa_tariff_USD_per_MWh", "ppa_price", "ppa_tariff", "tariff_usd_mwh"],
     "ppa_escalation": ["ppa_escalation", "ppa_cpi", "ppa_escalation_pa"],
     "gate_fee_usd_per_t": ["gate_fee_USD_per_ton", "tipping_fee", "gate_fee", "gate_fee_usd_t"],
@@ -94,14 +81,14 @@ def _get_defined_single(wb: Workbook, name: str) -> Optional[Any]:
     dn = wb.defined_names.get(name)
     if not dn:
         return None
-    dests = list(dn.destinations)
-    if len(dests) != 1:
-        if len(dests) == 0:
+    destinations = list(dn.destinations)
+    if len(destinations) != 1:
+        if len(destinations) == 0:
             return None
-        sheet, ref = dests[0]
+        sheet, ref = destinations[0]
         cell = wb[sheet][ref]
         return cell.value
-    sheet, ref = dests[0]
+    sheet, ref = destinations[0]
     ws = wb[sheet]
     if ":" in ref:
         start = ref.split(":")[0]
@@ -113,10 +100,10 @@ def _get_defined_range(wb: Workbook, name: str) -> Optional[List[float]]:
     dn = wb.defined_names.get(name)
     if not dn:
         return None
-    dests = list(dn.destinations)
-    if len(dests) == 0:
+    destinations = list(dn.destinations)
+    if len(destinations) == 0:
         return None
-    sheet, ref = dests[0]
+    sheet, ref = destinations[0]
     ws = wb[sheet]
     values: List[float] = []
     try:
@@ -129,9 +116,9 @@ def _get_defined_range(wb: Workbook, name: str) -> Optional[List[float]]:
                         except Exception:
                             pass
         else:
-            val = ws[ref].value
-            if val is not None:
-                values.append(float(val))
+            value = ws[ref].value
+            if value is not None:
+                values.append(float(value))
     except Exception:
         return None
     return values or None
@@ -161,73 +148,91 @@ def _safe_float(value: Any, default: float) -> float:
 
 
 def load_inputs_from_xlsm(path: str) -> WTEMasterInputs:
-    wb = load_workbook(path, read_only=False, data_only=True, keep_vba=True)
+    """Load assumptions from a macro-enabled workbook."""
 
+    wb = load_workbook(path, read_only=False, data_only=True, keep_vba=True)
     singles = {key: _get_named_first(wb, aliases) for key, aliases in NAME_MAP.items()}
     capex_profile = _get_named_range_first(wb, NAME_MAP["capex_spend_profile"])
 
-    build_months = int(_safe_float(singles.get("build_months"), 24))
-    ppy = int(_safe_float(singles.get("periods_per_year"), 4))
-    timeline = Timeline(years=25, build_months=build_months, start_year=2026, periods_per_year=ppy)
+    inputs = default_inputs()
 
-    tech = TechAssumptions(
-        msw_tonnes_pa=_safe_float(singles.get("msw_tonnes_pa"), 300_000.0),
-        lhv_mj_per_kg=_safe_float(singles.get("lhv_mj_per_kg"), 9.0),
-        boiler_efficiency=_maybe_percent("boiler_efficiency", singles.get("boiler_efficiency") or 0.85),
-        electrical_efficiency=_maybe_percent(
-            "electrical_efficiency", singles.get("electrical_efficiency") or 0.22
-        ),
-        availability=_maybe_percent("availability", singles.get("availability") or 0.90),
-        parasitic_load_frac=_maybe_percent("parasitic_load_frac", singles.get("parasitic_load_frac") or 0.10),
+    timeline = inputs.timeline
+    timeline.build_months = int(_safe_float(singles.get("build_months"), timeline.build_months))
+    timeline.periods_per_year = int(_safe_float(singles.get("periods_per_year"), timeline.periods_per_year))
+
+    tech = inputs.tech
+    tech.msw_tonnes_pa = _safe_float(singles.get("msw_tonnes_pa"), tech.msw_tonnes_pa)
+    tech.lhv_mj_per_kg = _safe_float(singles.get("lhv_mj_per_kg"), tech.lhv_mj_per_kg)
+    tech.boiler_efficiency = _maybe_percent("boiler_efficiency", singles.get("boiler_efficiency") or tech.boiler_efficiency)
+    tech.electrical_efficiency = _maybe_percent(
+        "electrical_efficiency", singles.get("electrical_efficiency") or tech.electrical_efficiency
+    )
+    tech.availability = _maybe_percent("availability", singles.get("availability") or tech.availability)
+    tech.parasitic_load_frac = _maybe_percent("parasitic_load_frac", singles.get("parasitic_load_frac") or tech.parasitic_load_frac)
+
+    revenue = inputs.revenue
+    revenue.ppa_price_usd_per_mwh = _safe_float(singles.get("ppa_price_usd_per_mwh"), revenue.ppa_price_usd_per_mwh)
+    revenue.ppa_escalation = _maybe_percent("ppa_escalation", singles.get("ppa_escalation") or revenue.ppa_escalation)
+    revenue.gate_fee_usd_per_t = _safe_float(singles.get("gate_fee_usd_per_t"), revenue.gate_fee_usd_per_t)
+    revenue.gate_fee_escalation = _maybe_percent(
+        "gate_fee_escalation", singles.get("gate_fee_escalation") or revenue.gate_fee_escalation
+    )
+    revenue.heat_price_usd_per_mwh = _safe_float(singles.get("heat_price_usd_per_mwh"), revenue.heat_price_usd_per_mwh)
+    revenue.metal_recovery_usd_per_t = _safe_float(singles.get("other_metal_usd_per_t"), revenue.metal_recovery_usd_per_t)
+    revenue.ash_revenue_usd_per_t = _safe_float(singles.get("other_ash_usd_per_t"), revenue.ash_revenue_usd_per_t)
+    revenue.other_escalation = _maybe_percent(
+        "other_escalation", singles.get("other_escalation") or revenue.other_escalation
     )
 
-    other_per_t = 0.0
-    if singles.get("other_metal_usd_per_t") is not None:
-        other_per_t += _safe_float(singles["other_metal_usd_per_t"], 0.0)
-    if singles.get("other_ash_usd_per_t") is not None:
-        other_per_t += _safe_float(singles["other_ash_usd_per_t"], 0.0)
-
-    revenue = RevenueAssumptions(
-        ppa_price_usd_per_mwh=_safe_float(singles.get("ppa_price_usd_per_mwh"), 110.0),
-        gate_fee_usd_per_t=_safe_float(singles.get("gate_fee_usd_per_t"), 25.0),
-        heat_price_usd_per_mwh=_safe_float(singles.get("heat_price_usd_per_mwh"), 0.0),
-        metal_recovery_usd_per_t=_safe_float(singles.get("other_metal_usd_per_t"), 0.0),
-        ash_revenue_usd_per_t=_safe_float(singles.get("other_ash_usd_per_t"), 0.0),
-        ppa_escalation=_maybe_percent("ppa_escalation", singles.get("ppa_escalation") or 0.0),
-        gate_fee_escalation=_maybe_percent("gate_fee_escalation", singles.get("gate_fee_escalation") or 0.0),
-        other_escalation=_maybe_percent("other_escalation", singles.get("other_escalation") or 0.0),
+    costs = inputs.costs
+    costs.capex_total_usd = _safe_float(singles.get("capex_total_usd"), costs.capex_total_usd)
+    costs.capex_spend_profile = capex_profile or costs.capex_spend_profile
+    costs.fixed_om_usd_pa = _safe_float(singles.get("fixed_om_usd_pa"), costs.fixed_om_usd_pa)
+    costs.variable_om_usd_per_t = _safe_float(singles.get("variable_om_usd_per_t"), costs.variable_om_usd_per_t)
+    costs.landfill_disposal_usd_per_t = _safe_float(
+        singles.get("landfill_disposal_usd_per_t"), costs.landfill_disposal_usd_per_t
     )
-
-    costs = CostAssumptions(
-        capex_total_usd=_safe_float(singles.get("capex_total_usd"), 180_000_000.0),
-        capex_spend_profile=capex_profile,
-        fixed_om_usd_pa=_safe_float(singles.get("fixed_om_usd_pa"), 10_000_000.0),
-        variable_om_usd_per_t=_safe_float(singles.get("variable_om_usd_per_t"), 15.0),
-        landfill_disposal_usd_per_t=_safe_float(singles.get("landfill_disposal_usd_per_t"), 5.0),
-        insurance_pct_of_capex_pa=_maybe_percent(
-            "insurance_pct_of_capex_pa", singles.get("insurance_pct_of_capex_pa") or 0.0075
-        ),
-        maintenance_pct_of_capex_pa=_maybe_percent(
-            "maintenance_pct_of_capex_pa", singles.get("maintenance_pct_of_capex_pa") or 0.02
-        ),
-        opex_escalation=_maybe_percent("opex_escalation", singles.get("opex_escalation") or 0.02),
+    costs.insurance_pct_of_capex_pa = _maybe_percent(
+        "insurance_pct_of_capex_pa", singles.get("insurance_pct_of_capex_pa") or costs.insurance_pct_of_capex_pa
     )
-
-    finance = FinanceAssumptions(
-        debt_ratio=_maybe_percent("debt_ratio", singles.get("debt_ratio") or 0.70),
-        interest_rate=_maybe_percent("interest_rate", singles.get("interest_rate") or 0.08),
-        tenor_years=int(_safe_float(singles.get("tenor_years"), 12)),
-        grace_years=int(_safe_float(singles.get("grace_years"), 2)),
-        upfront_fee_pct=_maybe_percent("upfront_fee_pct", singles.get("upfront_fee_pct") or 0.01),
-        dscr_min=_safe_float(singles.get("dscr_min"), 1.20),
-        tax_rate=_maybe_percent("tax_rate", singles.get("tax_rate") or 0.25),
-        depr_years=int(_safe_float(singles.get("depr_years"), 15)),
-        working_cap_days=int(_safe_float(singles.get("working_cap_days"), 30)),
-        discount_rate=_safe_float(singles.get("discount_rate"), 0.10),
+    costs.maintenance_pct_of_capex_pa = _maybe_percent(
+        "maintenance_pct_of_capex_pa", singles.get("maintenance_pct_of_capex_pa") or costs.maintenance_pct_of_capex_pa
     )
+    costs.opex_escalation = _maybe_percent("opex_escalation", singles.get("opex_escalation") or costs.opex_escalation)
 
-    mapped_debug = {
-        "timeline": {"build_months": build_months, "periods_per_year": ppy},
+    finance = inputs.finance
+    finance.debt_ratio = _maybe_percent("debt_ratio", singles.get("debt_ratio") or finance.debt_ratio)
+    finance.interest_rate = _maybe_percent("interest_rate", singles.get("interest_rate") or finance.interest_rate)
+    finance.tenor_years = int(_safe_float(singles.get("tenor_years"), finance.tenor_years))
+    finance.grace_years = int(_safe_float(singles.get("grace_years"), finance.grace_years))
+    finance.upfront_fee_pct = _maybe_percent("upfront_fee_pct", singles.get("upfront_fee_pct") or finance.upfront_fee_pct)
+    finance.dscr_min = _safe_float(singles.get("dscr_min"), finance.dscr_min)
+    finance.tax_rate = _maybe_percent("tax_rate", singles.get("tax_rate") or finance.tax_rate)
+    finance.depr_years = int(_safe_float(singles.get("depr_years"), finance.depr_years))
+    finance.working_cap_days = int(_safe_float(singles.get("working_cap_days"), finance.working_cap_days))
+    finance.discount_rate = _safe_float(singles.get("discount_rate"), finance.discount_rate)
+    finance.tax.corporate_rate = finance.tax_rate
+    finance.working_capital.receivable_days = finance.working_cap_days
+    finance.working_capital.payable_days = finance.working_cap_days
+
+    # align depreciation lives with capex items if only one item exists
+    if costs.capex_items:
+        for item in costs.capex_items:
+            if item.name.lower().startswith("land"):
+                continue
+            item.life_years = finance.depr_years
+
+    inputs.timeline = timeline
+    inputs.tech = tech
+    inputs.revenue = revenue
+    inputs.costs = costs
+    inputs.finance = finance
+
+    inputs_meta = {
+        "timeline": {
+            "build_months": timeline.build_months,
+            "periods_per_year": timeline.periods_per_year,
+        },
         "tech": tech.__dict__,
         "revenue": {
             "ppa_price_usd_per_mwh": revenue.ppa_price_usd_per_mwh,
@@ -241,7 +246,7 @@ def load_inputs_from_xlsm(path: str) -> WTEMasterInputs:
         },
         "costs": {
             "capex_total_usd": costs.capex_total_usd,
-            "capex_spend_profile": capex_profile[:10] if capex_profile else None,
+            "capex_spend_profile": costs.capex_spend_profile,
             "fixed_om_usd_pa": costs.fixed_om_usd_pa,
             "variable_om_usd_per_t": costs.variable_om_usd_per_t,
             "landfill_disposal_usd_per_t": costs.landfill_disposal_usd_per_t,
@@ -249,14 +254,20 @@ def load_inputs_from_xlsm(path: str) -> WTEMasterInputs:
             "maintenance_pct_of_capex_pa": costs.maintenance_pct_of_capex_pa,
             "opex_escalation": costs.opex_escalation,
         },
-        "finance": finance.__dict__,
+        "finance": {
+            "debt_ratio": finance.debt_ratio,
+            "interest_rate": finance.interest_rate,
+            "tenor_years": finance.tenor_years,
+            "grace_years": finance.grace_years,
+            "upfront_fee_pct": finance.upfront_fee_pct,
+            "dscr_min": finance.dscr_min,
+            "tax_rate": finance.tax_rate,
+            "depr_years": finance.depr_years,
+            "working_cap_days": finance.working_cap_days,
+            "discount_rate": finance.discount_rate,
+        },
     }
-    WTEMasterInputs._MAPPED_DEBUG = mapped_debug  # type: ignore[attr-defined]
+    WTEMasterInputs._MAPPED_DEBUG = inputs_meta  # type: ignore[attr-defined]
 
-    return WTEMasterInputs(
-        timeline=timeline,
-        tech=tech,
-        revenue=revenue,
-        costs=costs,
-        finance=finance,
-    )
+    return inputs
+

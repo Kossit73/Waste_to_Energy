@@ -1,22 +1,28 @@
 """Discounted cash flow model assembly."""
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 
 from .costs import capex_schedule, opex_block
 from .energy import energy_block
-from .finance import debt_schedule, depreciation_schedule, tax_block
+from .finance import (
+    coverage_ratios,
+    debt_schedule,
+    depreciation_schedule,
+    tax_block,
+    working_capital_block,
+)
 from .inputs import WTEMasterInputs
 from .revenue import revenue_block
 
 
-def _npv(rate: float, cashflows: list[float]) -> float:
+def _npv(rate: float, cashflows: List[float]) -> float:
     return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cashflows))
 
 
-def _irr(cashflows: list[float], guess: float = 0.1) -> float:
+def _irr(cashflows: List[float], guess: float = 0.1) -> float:
     """Compute internal rate of return using Newton-Raphson with bisection fallback."""
 
     rate = guess
@@ -43,49 +49,76 @@ def _irr(cashflows: list[float], guess: float = 0.1) -> float:
     return rate
 
 
-def cashflow_model(inp: WTEMasterInputs) -> Dict[str, np.ndarray | float]:
+def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np.ndarray | float]:
     """Run the full project cash flow model."""
 
     timeline = inp.timeline
-    ppy = timeline.periods_per_year
-    n = timeline.n
+    periods = timeline.n
 
     energy = energy_block(inp)
     revenue = revenue_block(inp, energy)
     capex = capex_schedule(inp)
     opex = opex_block(inp, energy)
-    debt = debt_schedule(inp, capex, 0)
     depr = depreciation_schedule(inp, capex)
 
     ebitda = revenue["total_revenue"] - opex["total_opex"]
-    ebt = ebitda - debt["interest"] - depr
-    tax = tax_block(inp, ebt, depr)
-    cfads = ebitda - tax
+    depreciation_total = depr["total"]
+
+    debt = debt_schedule(inp, capex["total"])
+
+    for iteration in range(2):
+        interest_cash = debt["interest_cash"]
+        taxable_income = ebitda - depreciation_total - interest_cash
+        tax = tax_block(inp, taxable_income, revenue["total_revenue"], energy)
+        wc = working_capital_block(inp, revenue, opex)
+        cfads = ebitda - tax["cash_tax"] - wc["cash_effect"]
+
+        if debt["needs_cfads"] and iteration == 0:
+            debt = debt_schedule(inp, capex["total"], cfads=cfads)
+            continue
+        break
+
+    # Recompute with final debt schedule to ensure consistency
+    interest_cash = debt["interest_cash"]
+    taxable_income = ebitda - depreciation_total - interest_cash
+    tax = tax_block(inp, taxable_income, revenue["total_revenue"], energy)
+    wc = working_capital_block(inp, revenue, opex)
+    cfads = ebitda - tax["cash_tax"] - wc["cash_effect"]
 
     debt_service = debt["debt_service"]
-    cfw = cfads - debt_service
+    fees = debt["fees"]
+    equity_invest = capex["total"] - debt["debt_draws"]
 
-    equity_invest = capex - debt["debt_draws"]
-    equity_cf = -equity_invest + cfw - debt["fees"]
+    withholding_rate = inp.finance.tax.withholding_rate
+    equity_before_withholding = cfads - debt_service - fees - equity_invest
+    withholding = np.where(equity_before_withholding > 0, equity_before_withholding * withholding_rate, 0.0)
+    equity_cf = equity_before_withholding - withholding
 
-    irr_eq = _irr(list(equity_cf))
-    proj_cf = list(-capex) + list(revenue["total_revenue"] - opex["total_opex"] - tax)
+    project_cash = revenue["total_revenue"] - opex["total_opex"] - tax["cash_tax"] - wc["cash_effect"]
+
+    proj_cf = list(project_cash - capex["total"])
     irr_proj = _irr(proj_cf)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dscr = np.where(debt_service > 0, cfads / debt_service, np.nan)
+    irr_eq = _irr(list(equity_cf))
+
+    coverage = coverage_ratios(debt, cfads, project_cash, timeline, inp.finance.discount_rate)
+    debt["llcr"] = coverage["llcr"]
+    debt["plcr"] = coverage["plcr"]
 
     return {
         "energy": energy,
         "rev": revenue,
-        "opex": opex,
         "capex": capex,
-        "debt": debt,
+        "opex": opex,
         "depr": depr,
+        "debt": debt,
         "tax": tax,
+        "working_capital": wc,
         "ebitda": ebitda,
         "cfads": cfads,
         "equity_cf": equity_cf,
+        "withholding": withholding,
         "irr_eq": irr_eq,
         "irr_proj": irr_proj,
-        "dscr": dscr,
+        "dscr": np.where(debt_service > 0, cfads / debt_service, np.nan),
     }
+
