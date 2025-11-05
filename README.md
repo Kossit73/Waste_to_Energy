@@ -49,8 +49,9 @@ section directly in the browser:
 
 1. Toggle the **Edit** checkbox that appears in each section header to unlock
    its number inputs and data tables.
-2. Use the **Add row**/**Remove row** buttons that appear above editable tables
-   (while in edit mode) to manage table length before updating cell values.
+2. Click directly into any cell once edit mode is enabled to replace the
+   shipped default values, and use the **Add row**/**Remove row** buttons above
+   each table (while in edit mode) whenever you need to change the row count.
 3. Open the **Manage defaults & state** panel on the *Input Landing* tab to
    restore the packaged defaults, clear all tables, or save/load your own
    custom preset.

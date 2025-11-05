@@ -209,6 +209,11 @@ def _editable_table(
     elif allow_row_controls and not edit_enabled:
         st.caption("Enable edit mode to add or remove rows.")
 
+    if not edit_enabled:
+        st.caption(
+            "Defaults are read-only. Toggle the **Edit** checkbox to change cell values or manage rows."
+        )
+
     edited = st.data_editor(
         base,
         key=f"editor_{key}",
@@ -910,9 +915,9 @@ with page_tabs[0]:
             """
             1. **Enable edit mode** – toggle the *Edit* checkbox for the section you want to
                update. Inputs remain read-only until editing is enabled.
-            2. **Adjust rows as needed** – once in edit mode, use the *Add row* and *Remove row*
-               buttons above each table to manage its contents before typing directly into the
-               cells.
+            2. **Edit or extend rows** – after enabling edit mode, click any cell in the default
+               table to overwrite its value, and use the *Add row*/*Remove row* buttons above each
+               schedule when you need to change the row count.
             3. **Manage default sets** – restore the shipped defaults, start with empty tables,
                or save/load your own presets from the *Manage defaults & state* panel.
             4. **Apply structured growth** – the *Yearly increment helper* lets you apply a
