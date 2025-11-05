@@ -1,6 +1,8 @@
 """Example runner for the waste-to-energy model."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from wte_model import (
@@ -8,6 +10,7 @@ from wte_model import (
     WTEMasterInputs,
     cashflow_model,
     default_inputs,
+    generate_excel_bytes,
     run_monte_carlo,
     run_sensitivity,
 )
@@ -86,6 +89,10 @@ def main() -> None:
     )
     for metric, stats in mc["summary"].items():
         print(metric, "=>", {k: round(v, 4) for k, v in stats.items()})
+
+    output_path = Path("wte_model_output.xlsx")
+    output_path.write_bytes(generate_excel_bytes(inputs, results, "Base Case"))
+    print(f"\nExcel export written to {output_path.resolve()}")
 
 
 if __name__ == "__main__":

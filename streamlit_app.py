@@ -6,7 +6,6 @@ import importlib.util
 import copy
 import re
 from dataclasses import dataclass, replace
-from io import BytesIO
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
@@ -33,8 +32,10 @@ from wte_model import (
     Timeline,
     WorkingCapitalAssumptions,
     WTEMasterInputs,
+    build_summary_tables,
     cashflow_model,
     default_inputs,
+    generate_excel_bytes,
 )
 
 
@@ -154,6 +155,18 @@ def _blank_row(df: pd.DataFrame) -> pd.DataFrame:
         else:
             row[col] = ""
     return pd.DataFrame([row])
+
+
+def _annualise(series: Iterable[float], ppy: int) -> pd.Series:
+    values = np.asarray(list(series), dtype=float)
+    if values.size == 0:
+        return pd.Series(dtype=float)
+    periods = np.arange(values.size)
+    years = periods // max(1, ppy)
+    df = pd.DataFrame({"year": years, "value": values})
+    annual = df.groupby("year", as_index=False)["value"].sum()
+    annual.index = annual["year"]
+    return annual["value"]
 
 
 def _section_header(title: str, key: str, *, level: str = "subheader") -> bool:
@@ -663,18 +676,6 @@ def _compute_initial_investment_schedule(df: pd.DataFrame) -> pd.DataFrame:
     return schedule
 
 
-def _annualise(series: Iterable[float], ppy: int) -> pd.Series:
-    values = np.asarray(list(series), dtype=float)
-    if values.size == 0:
-        return pd.Series(dtype=float)
-    periods = np.arange(values.size)
-    years = periods // max(1, ppy)
-    df = pd.DataFrame({"year": years, "value": values})
-    annual = df.groupby("year", as_index=False)["value"].sum()
-    annual.index = annual["year"]
-    return annual["value"]
-
-
 def _irr(values: Iterable[float]) -> float:
     cashflows = [float(v) for v in values]
     if not any(cashflows):
@@ -719,65 +720,6 @@ def _scenario_multiplier(value: Any) -> float:
     if abs(multiplier) > 1.0:
         multiplier /= 100.0
     return multiplier
-
-
-def _build_summary_tables(
-    inputs: WTEMasterInputs,
-    results: Dict[str, Any],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
-    """Assemble the period, annual, and cumulative summary tables for exports."""
-
-    energy = results["energy"]
-    revenue = results["rev"]
-    capex_total = results["capex"]["total"]
-    investment_total = results["capex"].get("investment_total", capex_total)
-    opex_total = results["opex"]["total_opex"]
-    tax_cash = results["tax"]["cash_tax"]
-    debt = results["debt"]
-
-    periods = np.arange(inputs.timeline.n)
-    years_axis = inputs.timeline.start_year + (periods // inputs.timeline.periods_per_year)
-
-    summary = pd.DataFrame(
-        {
-            "Period": periods + 1,
-            "Calendar Year": years_axis,
-            "Tonnes": energy["tonnes"],
-            "Net MWh": energy["net_mwh"],
-            "Total revenue": revenue["total_revenue"],
-            "Total opex": opex_total,
-            "EBITDA": results["ebitda"],
-            "CFADS": results["cfads"],
-            "Debt service": debt["debt_service"],
-            "Equity cash flow": results["equity_cf"],
-            "Capex": investment_total,
-            "Debt balance": debt["balance"],
-            "Tax": tax_cash,
-        }
-    )
-
-    summary_ann = summary.groupby("Calendar Year", as_index=False).agg(
-        {
-            "Tonnes": "sum",
-            "Net MWh": "sum",
-            "Total revenue": "sum",
-            "Total opex": "sum",
-            "EBITDA": "sum",
-            "CFADS": "sum",
-            "Debt service": "sum",
-            "Equity cash flow": "sum",
-            "Capex": "sum",
-            "Tax": "sum",
-        }
-    )
-
-    summary_cumulative = summary.copy()
-    for col in ["Total revenue", "Total opex", "Equity cash flow", "Capex", "CFADS"]:
-        summary_cumulative[f"Cumulative {col}"] = summary_cumulative[col].cumsum()
-
-    production_annual_series = _annualise(energy["tonnes"], inputs.timeline.periods_per_year)
-
-    return summary, summary_ann, summary_cumulative, production_annual_series
 
 
 def _ensure_scenario_payload(
@@ -841,39 +783,6 @@ def _ensure_scenario_payload(
     payloads[scenario_name] = (inputs_copy, results_payload)
     st.session_state["scenario_payloads"] = payloads
     return inputs_copy, results_payload
-
-
-def _generate_excel_bytes(
-    model_inputs: WTEMasterInputs,
-    results: Dict[str, Any],
-    scenario_name: str,
-) -> bytes:
-    """Create an Excel workbook containing the key model outputs."""
-
-    summary, summary_ann, summary_cumulative, _ = _build_summary_tables(model_inputs, results)
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame({"Scenario": [scenario_name]}).to_excel(
-            writer, sheet_name="Scenario", index=False
-        )
-        summary.to_excel(writer, sheet_name="Period Summary", index=False)
-        summary_ann.to_excel(writer, sheet_name="Annual Summary", index=False)
-        summary_cumulative.to_excel(writer, sheet_name="Cumulative", index=False)
-        pd.DataFrame(results["energy"]).to_excel(writer, sheet_name="Energy", index=False)
-        pd.DataFrame(results["rev"]).to_excel(writer, sheet_name="Revenue", index=False)
-        pd.DataFrame(results["opex"]).to_excel(writer, sheet_name="Opex", index=False)
-        pd.DataFrame(results["capex"]).to_excel(writer, sheet_name="Capex", index=False)
-        pd.DataFrame(results["debt"]).to_excel(writer, sheet_name="Debt", index=False)
-        pd.DataFrame({"Equity cash flow": results["equity_cf"]}).to_excel(
-            writer, sheet_name="Equity CF", index=False
-        )
-        pd.DataFrame({"CFADS": results["cfads"]}).to_excel(
-            writer, sheet_name="CFADS", index=False
-        )
-
-    output.seek(0)
-    return output.getvalue()
 
 
 def _set_default(key: str, value):
@@ -2032,7 +1941,7 @@ user_inputs = WTEMasterInputs(
 
 results = cashflow_model(user_inputs)
 
-summary, summary_ann, summary_cumulative, production_annual_series = _build_summary_tables(
+summary, summary_ann, summary_cumulative, production_annual_series = build_summary_tables(
     user_inputs, results
 )
 
@@ -2573,14 +2482,16 @@ with page_tabs[9]:
         if not excel_bytes:
             if st.button("Prepare Excel Model", key=f"prepare_excel_{selected_scenario.lower()}"):
                 with st.spinner("Preparing Excel workbook..."):
-                    excel_bytes = _generate_excel_bytes(model, scenario_payload_results, selected_scenario)
+                    excel_bytes = generate_excel_bytes(
+                        model, scenario_payload_results, selected_scenario
+                    )
                 excel_map[selected_scenario] = excel_bytes
                 st.session_state.excel_bytes_map = excel_map
         if excel_bytes:
             st.download_button(
                 "Download Excel Model",
                 data=excel_bytes,
-                file_name="Ecommerce_Financial_Model.xlsx",
+                file_name="Waste_to_Energy_Financial_Model.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             if st.button(

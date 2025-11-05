@@ -27,6 +27,7 @@ from .finance import (
     working_capital_block,
 )
 from .dcf import cashflow_model
+from .export_excel import build_summary_tables, generate_excel_bytes
 from .scenario import (
     MonteCarloConfig,
     apply_scenarios,
@@ -59,6 +60,8 @@ __all__ = [
     "tax_block",
     "coverage_ratios",
     "cashflow_model",
+    "build_summary_tables",
+    "generate_excel_bytes",
     "default_inputs",
     "run_sensitivity",
     "run_monte_carlo",

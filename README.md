@@ -40,7 +40,9 @@ streamlit run streamlit_app.py
 Once the server starts, open the provided URL in your browser. Navigate across
 the horizontal tabs to configure projection settings, edit inputs, review
 metrics, and run sensitivities. Use the scenario download panel to export a
-full Excel model whenever you need an offline copy.
+full Excel model whenever you need an offline copy. The same workbook builder
+is exposed through `wte_model.export_excel`, so scripts (including
+`run_example.py`) can generate identical Excel outputs directly to disk.
 
 ### Editing the default figures
 
@@ -78,6 +80,7 @@ you can install them before redeploying.
 - `wte_model/costs.py` – builds capex and operating cost schedules.
 - `wte_model/finance.py` – handles debt schedules, depreciation, and tax.
 - `wte_model/dcf.py` – assembles the full cash flow model and metrics.
+- `wte_model/export_excel.py` – shared summary-table and Excel export utilities.
 - `wte_model/io_excel.py` – helper to read assumptions from a macro-enabled Excel workbook.
 - `streamlit_app.py` – interactive dashboard built on top of the model.
 - `run_example.py` – example entry point that ties everything together.
