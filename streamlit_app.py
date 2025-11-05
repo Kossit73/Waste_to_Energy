@@ -94,7 +94,12 @@ def _blank_row(df: pd.DataFrame) -> pd.DataFrame:
     row = {}
     for col in df.columns:
         series = df[col]
-        row[col] = 0.0 if is_numeric_dtype(series) else ""
+        if is_bool_dtype(series):
+            row[col] = False
+        elif is_numeric_dtype(series):
+            row[col] = 0.0
+        else:
+            row[col] = ""
     return pd.DataFrame([row])
 
 
@@ -169,6 +174,58 @@ def _text_area_control(
     return st.session_state.get(key, widget_value)
 
 
+def _input_widget_for_column(
+    *,
+    column: str,
+    value: Any,
+    series: Optional[pd.Series],
+    key: str,
+    disabled: bool = False,
+) -> Any:
+    """Render an input widget appropriate for the column type."""
+
+    bool_series = series is not None and is_bool_dtype(series)
+    if bool_series:
+        default_bool = False if value is None or pd.isna(value) else bool(value)
+        return st.checkbox(
+            column,
+            value=default_bool,
+            key=key,
+            disabled=disabled,
+        )
+
+    numeric_series = series is not None and is_numeric_dtype(series)
+    integer_series = series is not None and is_integer_dtype(series)
+
+    if not numeric_series and isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        numeric_series = True
+        integer_series = isinstance(value, (int, np.integer))
+
+    if numeric_series:
+        default_value = 0.0 if value is None or pd.isna(value) else float(value)
+        if integer_series:
+            widget_val = st.number_input(
+                column,
+                value=int(default_value),
+                step=1,
+                key=key,
+                disabled=disabled,
+            )
+            return int(widget_val)
+        widget_val = st.number_input(
+            column,
+            value=float(default_value),
+            step=0.01,
+            format="%.6f",
+            key=key,
+            disabled=disabled,
+        )
+        return float(widget_val)
+
+    default_text = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+    return st.text_input(column, value=default_text, key=key, disabled=disabled)
+
+
 def _editable_table(
     key: str,
     data: pd.DataFrame,
@@ -182,18 +239,26 @@ def _editable_table(
 ) -> pd.DataFrame:
     base = _ensure_state_df(key, data.copy())
 
+    dialog_key = f"{key}_add_dialog_open"
+    pending_key = f"{key}_pending_new_row"
+
+    if not edit_enabled:
+        st.session_state.pop(dialog_key, None)
+        st.session_state.pop(pending_key, None)
+
     if allow_row_controls and edit_enabled:
         ctrl_cols = st.columns(2)
         with ctrl_cols[0]:
             if st.button("Add row", key=f"add_{key}"):
-                template = base if not base.empty else data
+                template_source = base if not base.empty else data
                 new_row_df = new_row_factory() if new_row_factory else None
                 if new_row_df is None or new_row_df.empty:
-                    new_row_df = _blank_row(template)
-                if new_row_df is not None:
-                    combined = pd.concat([base, new_row_df], ignore_index=True)
-                    _update_table_state(key, combined)
-                    base = combined
+                    new_row_df = _blank_row(template_source)
+                if new_row_df is not None and not new_row_df.empty:
+                    st.session_state[pending_key] = new_row_df.reset_index(drop=True)
+                    st.session_state[dialog_key] = True
+                else:
+                    st.warning("Unable to create a template for the new row.")
         with ctrl_cols[1]:
             if base.empty:
                 st.write("No rows to remove")
@@ -212,7 +277,18 @@ def _editable_table(
     elif allow_row_controls and not edit_enabled:
         st.caption("Enable edit mode to add or remove rows.")
 
-    if not edit_enabled:
+    if edit_enabled:
+        template_source = base if not base.empty else data
+        updated_df = _handle_add_row_dialog(
+            key=key,
+            table=st.session_state[key],
+            template_source=template_source,
+            dialog_key=dialog_key,
+            pending_key=pending_key,
+        )
+        if updated_df is not None:
+            base = updated_df
+    else:
         st.caption(
             "Defaults are read-only. Toggle the **Edit** checkbox to change cell values or manage rows."
         )
@@ -287,31 +363,13 @@ def _editable_table(
                     cell_value = row[col]
                     safe_col = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
                     widget_key = f"{key}_row_active_{safe_col}"
-
-                    if is_bool_dtype(table[col]):
-                        current_val = bool(cell_value)
-                        new_val = st.checkbox(col, value=current_val, key=widget_key)
-                    elif is_numeric_dtype(table[col]):
-                        default_val = 0.0 if pd.isna(cell_value) else float(cell_value)
-                        if is_integer_dtype(table[col]):
-                            new_val = st.number_input(
-                                col,
-                                value=int(default_val),
-                                step=1,
-                                key=widget_key,
-                            )
-                            new_val = int(new_val)
-                        else:
-                            new_val = st.number_input(
-                                col,
-                                value=default_val,
-                                step=0.01,
-                                format="%.6f",
-                                key=widget_key,
-                            )
-                    else:
-                        default_str = "" if pd.isna(cell_value) else str(cell_value)
-                        new_val = st.text_input(col, value=default_str, key=widget_key)
+                    series = table[col] if col in table.columns else None
+                    new_val = _input_widget_for_column(
+                        column=col,
+                        value=cell_value,
+                        series=series,
+                        key=widget_key,
+                    )
                     updated_values[col] = new_val
 
                 action_cols = st.columns(2)
@@ -333,6 +391,110 @@ def _editable_table(
                     st.info("Row edit cancelled.")
 
     return st.session_state[key]
+
+
+def _handle_add_row_dialog(
+    *,
+    key: str,
+    table: pd.DataFrame,
+    template_source: pd.DataFrame,
+    dialog_key: str,
+    pending_key: str,
+) -> Optional[pd.DataFrame]:
+    """Render the add-row dialog if requested and return the updated table."""
+
+    if not st.session_state.get(dialog_key):
+        return None
+
+    pending = st.session_state.get(pending_key)
+    if pending is None:
+        st.session_state.pop(dialog_key, None)
+        return None
+
+    if isinstance(pending, pd.DataFrame):
+        pending_df = pending.copy()
+    elif isinstance(pending, dict):
+        pending_df = pd.DataFrame([pending])
+    else:
+        pending_df = pd.DataFrame()
+
+    if pending_df.empty:
+        st.session_state.pop(dialog_key, None)
+        st.session_state.pop(pending_key, None)
+        st.warning("No template data available for the new row.")
+        return None
+
+    columns: List[str] = list(template_source.columns)
+    for col in pending_df.columns:
+        if col not in columns:
+            columns.append(col)
+
+    if not columns:
+        st.session_state.pop(dialog_key, None)
+        st.session_state.pop(pending_key, None)
+        st.warning("No columns defined for this table; cannot add a new row.")
+        return None
+
+    type_table = template_source if not template_source.empty else pending_df
+
+    def _render_form() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        with st.form(f"{key}_add_row_form"):
+            inputs: Dict[str, Any] = {}
+            for col in columns:
+                safe_col = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
+                widget_key = f"{key}_add_{safe_col}"
+                default_val = (
+                    pending_df.iloc[0][col]
+                    if col in pending_df.columns
+                    else None
+                )
+                series = None
+                if col in type_table.columns:
+                    series = type_table[col]
+                new_val = _input_widget_for_column(
+                    column=col,
+                    value=default_val,
+                    series=series,
+                    key=widget_key,
+                )
+                inputs[col] = new_val
+
+            action_cols = st.columns(2)
+            submit = action_cols[0].form_submit_button(
+                "Add row", use_container_width=True
+            )
+            cancel = action_cols[1].form_submit_button(
+                "Cancel", use_container_width=True
+            )
+        if submit:
+            return inputs, "submit"
+        if cancel:
+            return None, "cancel"
+        return None, None
+
+    modal_fn = getattr(st, "modal", None)
+    if callable(modal_fn):
+        with modal_fn("Add new row"):
+            st.subheader("Add new row")
+            values, action = _render_form()
+    else:
+        with st.expander("Add new row", expanded=True):
+            values, action = _render_form()
+
+    if action == "submit" and values is not None:
+        new_row_df = pd.DataFrame([values], columns=columns)
+        combined = pd.concat([table, new_row_df], ignore_index=True)
+        _update_table_state(key, combined)
+        st.session_state.pop(dialog_key, None)
+        st.session_state.pop(pending_key, None)
+        st.success("Row added.")
+        return combined
+    if action == "cancel":
+        st.session_state.pop(dialog_key, None)
+        st.session_state.pop(pending_key, None)
+        st.info("Row addition cancelled.")
+
+    return None
 
 
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
