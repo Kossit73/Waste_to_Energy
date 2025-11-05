@@ -39,8 +39,8 @@ streamlit run streamlit_app.py
 
 Once the server starts, open the provided URL in your browser. Navigate across
 the horizontal tabs to configure projection settings, edit inputs, review
-metrics, and run sensitivities. A CSV export button lets you download the
-calculated cash-flow table at any time.
+metrics, and run sensitivities. Use the scenario download panel to export a
+full Excel model whenever you need an offline copy.
 
 ### Editing the default figures
 

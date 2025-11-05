@@ -2158,14 +2158,6 @@ with page_tabs[10]:
 st.subheader("Model Outputs Snapshot")
 st.dataframe(summary.head(12).round(2), use_container_width=True)
 
-cash_csv = summary.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="Download cash flow CSV",
-    data=cash_csv,
-    file_name="wte_cashflows.csv",
-    mime="text/csv",
-)
-
 st.info(
     "All navigation is organised horizontally across the page. Use the tabs to explore inputs, "
     "results, sensitivities, and scenario tools without relying on a sidebar."
