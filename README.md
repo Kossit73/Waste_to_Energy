@@ -60,6 +60,15 @@ section directly in the browser:
 5. All edits cascade instantly through the dashboards, statements, and
    analytics tabs, so you can validate the impact without reloading the app.
 
+### Troubleshooting Streamlit deployment
+
+If the app fails to start with an error about missing packages (for example
+`ModuleNotFoundError: No module named 'numpy'`), make sure the runtime has
+installed the project requirements. Running `pip install -r requirements.txt`
+inside the deployment environment resolves the issue. The Streamlit app now
+performs a pre-flight dependency check and will point out any missing modules so
+you can install them before redeploying.
+
 ## Package overview
 
 - `wte_model/inputs.py` – dataclasses representing the model inputs.

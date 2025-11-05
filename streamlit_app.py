@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional
+
+
+_REQUIRED_PACKAGES = ("numpy", "pandas", "streamlit")
+_missing = [pkg for pkg in _REQUIRED_PACKAGES if importlib.util.find_spec(pkg) is None]
+if _missing:
+    missing_list = ", ".join(sorted(_missing))
+    raise ModuleNotFoundError(
+        "Missing required dependencies: "
+        f"{missing_list}. Install them with 'pip install -r requirements.txt' before running the Streamlit app."
+    )
 
 import numpy as np
 import pandas as pd
