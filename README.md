@@ -55,9 +55,9 @@ section directly in the browser:
 3. Open the **Manage defaults & state** panel on the *Input Landing* tab to
    restore the packaged defaults, clear all tables, or save/load your own
    custom preset.
-4. The **Yearly increment helper** can apply a compound annual change to any
-   numeric column when the related section is in edit mode, speeding up bulk
-   adjustments.
+4. Each schedule features a **Yearly increment** expander directly below the
+   table. Open it while the section is in edit mode to apply compound annual
+   changes to numeric columns without editing every row manually.
 5. All edits cascade instantly through the dashboards, statements, and
    analytics tabs, so you can validate the impact without reloading the app.
 

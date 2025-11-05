@@ -497,6 +497,73 @@ def _handle_add_row_dialog(
     return None
 
 
+def _render_yearly_increment_helper(
+    table_key: str,
+    *,
+    template: Optional[pd.DataFrame] = None,
+    label: Optional[str] = None,
+) -> pd.DataFrame:
+    """Render a yearly increment helper directly beneath a schedule."""
+
+    template_df = template.copy() if template is not None else pd.DataFrame()
+    table_df = _ensure_state_df(table_key, template_df)
+
+    label = label or TABLE_LABELS.get(table_key, table_key.replace("_", " ").title())
+
+    with st.expander("Yearly increment", expanded=False):
+        st.caption(
+            "Apply compound annual adjustments to the numeric columns in this schedule."
+        )
+
+        if table_df.empty:
+            st.info("Add rows to the table to enable yearly increments.")
+            return table_df
+
+        numeric_cols = [col for col in table_df.columns if is_numeric_dtype(table_df[col])]
+        if not numeric_cols:
+            st.info("No numeric columns available for yearly increments.")
+            return table_df
+
+        edit_flag = st.session_state.get(f"{table_key}_edit_toggle", False)
+        if not edit_flag:
+            st.info("Enable edit mode for this table to apply increments.")
+            return table_df
+
+        column = st.selectbox(
+            "Column",
+            numeric_cols,
+            key=f"{table_key}_increment_column",
+        )
+
+        column_series = table_df[column].fillna(0.0)
+        base_default = float(column_series.iloc[0]) if not column_series.empty else 0.0
+
+        base_value = st.number_input(
+            "Base value",
+            value=float(base_default),
+            key=f"{table_key}_increment_base",
+        )
+        increment_pct = st.number_input(
+            "Annual increment (%)",
+            value=0.0,
+            step=0.5,
+            key=f"{table_key}_increment_pct",
+        )
+
+        if st.button("Apply increment", key=f"{table_key}_apply_increment"):
+            periods = len(table_df)
+            growth = np.array([(1 + increment_pct / 100.0) ** i for i in range(periods)], dtype=float)
+            updated = table_df.copy()
+            updated[column] = base_value * growth
+            _update_table_state(table_key, updated)
+            table_df = updated
+            st.success(
+                f"Applied {increment_pct:.2f}% annual increment to {label} ({column})."
+            )
+
+    return table_df
+
+
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
     for key, value in values.items():
         st.session_state[key] = value
@@ -1189,9 +1256,9 @@ with page_tabs[0]:
                want to update and submit the form to save changes.
             3. **Manage default sets** – restore the shipped defaults, start with empty tables,
                or save/load your own presets from the *Manage defaults & state* panel.
-            4. **Apply structured growth** – the *Yearly increment helper* lets you apply a
-               compound annual change to any numeric column while the relevant section is in
-               edit mode.
+            4. **Apply structured growth** – each schedule includes a *Yearly increment*
+               expander directly beneath the table; open it while in edit mode to apply
+               compound annual changes to numeric columns.
             5. **Review downstream impact** – every edit flows automatically into the dashboards,
                statements, and analytics tabs so you can validate changes immediately.
             """
@@ -1221,59 +1288,6 @@ with page_tabs[0]:
                 for key, df in st.session_state.get("custom_table_defaults", {}).items():
                     _update_table_state(key, df)
                 st.success("Loaded custom defaults.")
-
-    with st.expander("Yearly increment helper", expanded=False):
-        available_tables = {
-            key: _ensure_state_df(key, df.copy()) for key, df in TABLE_DEFAULTS.items()
-        }
-        options = [
-            key for key, df in available_tables.items()
-            if not df.empty and any(is_numeric_dtype(df[col]) for col in df.columns)
-        ]
-        if not options:
-            st.info("Add rows to a table to enable yearly increments.")
-        else:
-            table_key = st.selectbox(
-                "Table",
-                options,
-                format_func=lambda k: TABLE_LABELS.get(k, k.replace("_", " ").title()),
-                key="increment_table_select",
-            )
-            table_df = available_tables[table_key].copy()
-            numeric_cols = [col for col in table_df.columns if is_numeric_dtype(table_df[col])]
-            column = st.selectbox(
-                "Column",
-                numeric_cols,
-                key=f"increment_column_{table_key}",
-            )
-            edit_flag = st.session_state.get(f"{table_key}_edit_toggle", False)
-            if not edit_flag:
-                st.info("Enable edit mode for this table to apply increments.")
-            else:
-                default_base = float(table_df[column].fillna(0.0).iloc[0]) if not table_df.empty else 0.0
-                base_value = st.number_input(
-                    "Base value",
-                    value=float(default_base),
-                    key=f"increment_base_{table_key}",
-                )
-                increment_pct = st.number_input(
-                    "Annual increment (%)",
-                    value=0.0,
-                    step=0.5,
-                    key=f"increment_pct_{table_key}",
-                )
-                if st.button("Apply increment", key=f"apply_increment_{table_key}"):
-                    if table_df.empty:
-                        st.warning("Table has no rows to update.")
-                    else:
-                        growth = [(1 + increment_pct / 100.0) ** i for i in range(len(table_df))]
-                        updated = table_df.copy()
-                        updated[column] = [base_value * g for g in growth]
-                        _update_table_state(table_key, updated)
-                        st.success(
-                            f"Applied {increment_pct:.2f}% annual increment to "
-                            f"{TABLE_LABELS.get(table_key, column)}"
-                        )
 
     proj_edit = _section_header("Projection Horizon", "projection_horizon")
     col_proj1, col_proj2, col_proj3 = st.columns(3)
@@ -1321,6 +1335,11 @@ with page_tabs[0]:
         row_edit_controls=True,
         row_label_field="Parameter",
     )
+    global_inputs = _render_yearly_increment_helper(
+        "global_inputs",
+        template=global_defaults,
+        label="Global inputs",
+    )
 
     initial_edit = _section_header("Initial Investment Inputs", "initial_investment")
     initial_investment = _editable_table(
@@ -1334,6 +1353,11 @@ with page_tabs[0]:
         edit_enabled=initial_edit,
         row_edit_controls=True,
         row_label_field="Item",
+    )
+    initial_investment = _render_yearly_increment_helper(
+        "initial_investment",
+        template=initial_investment_defaults,
+        label="Initial investment",
     )
 
     schedule = _compute_initial_investment_schedule(initial_investment)
@@ -1360,6 +1384,11 @@ with page_tabs[1]:
         row_edit_controls=True,
         row_label_field="Revenue stream",
     )
+    revenue_table = _render_yearly_increment_helper(
+        "revenue_inputs",
+        template=revenue_defaults,
+        label="Revenue inputs",
+    )
 
     st.subheader("Production Assumptions")
     prod_tabs = st.tabs(["Annual", "Monthly"])
@@ -1376,6 +1405,11 @@ with page_tabs[1]:
             row_edit_controls=True,
             row_label_field="Year",
         )
+        production_annual = _render_yearly_increment_helper(
+            "production_annual",
+            template=production_annual_defaults,
+            label="Annual production",
+        )
     with prod_tabs[1]:
         prod_monthly_edit = _section_header("Monthly production", "production_monthly")
         production_monthly = _editable_table(
@@ -1388,6 +1422,11 @@ with page_tabs[1]:
             edit_enabled=prod_monthly_edit,
             row_edit_controls=True,
             row_label_field="Month",
+        )
+        production_monthly = _render_yearly_increment_helper(
+            "production_monthly",
+            template=production_monthly_defaults,
+            label="Monthly production",
         )
 
     tech_edit = _section_header("Technology Inputs", "technology_inputs")
@@ -1543,6 +1582,11 @@ with page_tabs[2]:
         row_edit_controls=True,
         row_label_field="Month",
     )
+    direct_costs_monthly = _render_yearly_increment_helper(
+        "direct_costs_monthly",
+        template=direct_costs_monthly_defaults,
+        label="Direct costs monthly",
+    )
 
     staff_edit = _section_header("Staff Costs (Monthly)", "staff_monthly")
     staff_monthly = _editable_table(
@@ -1556,6 +1600,11 @@ with page_tabs[2]:
         row_edit_controls=True,
         row_label_field="Role",
     )
+    staff_monthly = _render_yearly_increment_helper(
+        "staff_monthly",
+        template=staff_monthly_defaults,
+        label="Staff costs monthly",
+    )
 
     other_opex_edit = _section_header("Other Opex (Monthly)", "other_opex_monthly")
     other_opex_monthly = _editable_table(
@@ -1568,6 +1617,11 @@ with page_tabs[2]:
         edit_enabled=other_opex_edit,
         row_edit_controls=True,
         row_label_field="Category",
+    )
+    other_opex_monthly = _render_yearly_increment_helper(
+        "other_opex_monthly",
+        template=other_opex_monthly_defaults,
+        label="Other opex monthly",
     )
 
     st.subheader("Working Capital Inputs")
@@ -1585,6 +1639,11 @@ with page_tabs[2]:
             row_edit_controls=True,
             row_label_field="Metric",
         )
+        accounts_receivable = _render_yearly_increment_helper(
+            "accounts_receivable",
+            template=accounts_receivable_defaults,
+            label="Accounts receivable",
+        )
     with col_wc2:
         payable_edit = _section_header("Inventory & payables", "inventory_payable", level="markdown")
         inventory_payable = _editable_table(
@@ -1597,6 +1656,11 @@ with page_tabs[2]:
             edit_enabled=payable_edit,
             row_edit_controls=True,
             row_label_field="Metric",
+        )
+        inventory_payable = _render_yearly_increment_helper(
+            "inventory_payable",
+            template=inventory_payable_defaults,
+            label="Inventory & payables",
         )
 
     cost_edit = _section_header("Cost Structure Controls", "cost_structure")
@@ -1782,6 +1846,11 @@ with page_tabs[3]:
         row_edit_controls=True,
         row_label_field="Facility",
     )
+    loan_schedule = _render_yearly_increment_helper(
+        "loan_schedule",
+        template=loan_schedule_defaults,
+        label="Loan schedule",
+    )
 
     tax_edit = _section_header("Tax Schedule", "tax_schedule")
     tax_schedule = _editable_table(
@@ -1797,6 +1866,11 @@ with page_tabs[3]:
         row_edit_controls=True,
         row_label_field="Tax",
     )
+    tax_schedule = _render_yearly_increment_helper(
+        "tax_schedule",
+        template=tax_schedule_defaults,
+        label="Tax schedule",
+    )
 
     inflation_edit = _section_header("Inflation Schedule", "inflation_schedule")
     inflation_schedule = _editable_table(
@@ -1809,6 +1883,11 @@ with page_tabs[3]:
         edit_enabled=inflation_edit,
         row_edit_controls=True,
         row_label_field="Category",
+    )
+    inflation_schedule = _render_yearly_increment_helper(
+        "inflation_schedule",
+        template=inflation_schedule_defaults,
+        label="Inflation schedule",
     )
 
     risk_edit = _section_header("Risk Schedule", "risk_schedule")
@@ -1824,6 +1903,11 @@ with page_tabs[3]:
         edit_enabled=risk_edit,
         row_edit_controls=True,
         row_label_field="Risk",
+    )
+    risk_schedule = _render_yearly_increment_helper(
+        "risk_schedule",
+        template=risk_schedule_defaults,
+        label="Risk schedule",
     )
 
 
@@ -2210,6 +2294,11 @@ with page_tabs[8]:
         row_edit_controls=True,
         row_label_field="Driver",
     )
+    sensitivity_config = _render_yearly_increment_helper(
+        "sensitivity_config",
+        template=sensitivity_config_defaults,
+        label="Sensitivity configuration",
+    )
 
     st.subheader("Simulation Results")
     simulated = []
@@ -2262,6 +2351,11 @@ with page_tabs[8]:
         row_edit_controls=True,
         row_label_field="Variable",
     )
+    monte_carlo_config = _render_yearly_increment_helper(
+        "monte_carlo_config",
+        template=monte_carlo_defaults_runtime,
+        label="Monte Carlo configuration",
+    )
     if not monte_carlo_config.empty:
         st.write(
             "Simulated IRR range (conceptual):",
@@ -2282,6 +2376,11 @@ with page_tabs[9]:
         edit_enabled=goal_edit,
         row_edit_controls=True,
         row_label_field="Target metric",
+    )
+    goal_seek = _render_yearly_increment_helper(
+        "goal_seek",
+        template=goal_seek_defaults,
+        label="Goal seek configuration",
     )
 
     st.subheader("Goal Seek Results")
@@ -2325,6 +2424,11 @@ with page_tabs[9]:
         edit_enabled=scenario_edit,
         row_edit_controls=True,
         row_label_field="Scenario",
+    )
+    scenario_config = _render_yearly_increment_helper(
+        "scenario_config",
+        template=scenario_config_defaults,
+        label="Scenario configuration",
     )
 
     scenario_signature = scenario_config.to_csv(index=False) if not scenario_config.empty else ""
@@ -2442,6 +2546,11 @@ with page_tabs[10]:
         row_edit_controls=True,
         row_label_field="Input",
     )
+    break_even_inputs = _render_yearly_increment_helper(
+        "break_even_inputs",
+        template=break_even_defaults,
+        label="Break-even inputs",
+    )
 
     st.subheader("Break-Even Results Background")
     break_even_revenue = annual_revenue.sum()
@@ -2460,6 +2569,11 @@ with page_tabs[10]:
         edit_enabled=parameter_edit,
         row_edit_controls=True,
         row_label_field="Parameter",
+    )
+    parameter_naming = _render_yearly_increment_helper(
+        "parameter_naming",
+        template=parameter_naming_defaults,
+        label="Parameter naming",
     )
     st.dataframe(parameter_naming, use_container_width=True)
 
