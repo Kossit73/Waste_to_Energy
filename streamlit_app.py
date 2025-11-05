@@ -39,6 +39,37 @@ from wte_model import (
 )
 
 
+AI_PROVIDER_OPTIONS = ("OpenAI", "Azure OpenAI", "Anthropic", "Vertex AI", "Custom")
+
+ML_METHOD_LABELS = {
+    "linear_regression": "Linear regression",
+    "random_forest": "Random forest",
+    "xgboost": "Gradient boosted trees",
+    "prophet": "Prophet trend model",
+}
+
+ML_LABEL_TO_CODE = {label: code for code, label in ML_METHOD_LABELS.items()}
+
+GEN_AI_FEATURE_LABELS = {
+    "summary": "Executive summary",
+    "risk": "Risk highlights",
+    "recommendations": "Recommendations",
+    "variance_analysis": "Variance analysis",
+}
+
+GEN_AI_LABEL_TO_CODE = {label: code for code, label in GEN_AI_FEATURE_LABELS.items()}
+
+DEFAULT_AI_SETTINGS = {
+    "enabled": False,
+    "provider": "OpenAI",
+    "model": "gpt-4",
+    "forecast_horizon": 3,
+    "ml_methods": ["linear_regression"],
+    "generative_features": ["summary"],
+    "api_key": "",
+}
+
+
 st.set_page_config(page_title="Waste-to-Energy Model", layout="wide")
 st.title("Waste-to-Energy Financial Workspace")
 st.caption(
@@ -167,6 +198,143 @@ def _annualise(series: Iterable[float], ppy: int) -> pd.Series:
     annual = df.groupby("year", as_index=False)["value"].sum()
     annual.index = annual["year"]
     return annual["value"]
+
+
+def _payload_to_ai_settings(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Extract AI settings from an arbitrary payload dictionary."""
+
+    settings = dict(DEFAULT_AI_SETTINGS)
+    if isinstance(payload, dict):
+        raw = payload.get("ai_settings") or payload.get("ai") or {}
+        if isinstance(raw, dict):
+            for key in settings:
+                if key in raw:
+                    settings[key] = raw[key]
+    return settings
+
+
+def _ai_settings_to_payload(settings: Dict[str, Any], payload: Dict[str, Any] | None) -> None:
+    """Persist AI settings back onto the supplied payload dictionary."""
+
+    if not isinstance(payload, dict):
+        return
+    stored = {
+        "enabled": bool(settings.get("enabled", False)),
+        "provider": settings.get("provider", DEFAULT_AI_SETTINGS["provider"]),
+        "model": settings.get("model", DEFAULT_AI_SETTINGS["model"]),
+        "forecast_horizon": int(settings.get("forecast_horizon", DEFAULT_AI_SETTINGS["forecast_horizon"])),
+        "ml_methods": list(settings.get("ml_methods", DEFAULT_AI_SETTINGS["ml_methods"])),
+        "generative_features": list(
+            settings.get("generative_features", DEFAULT_AI_SETTINGS["generative_features"])
+        ),
+        "api_key": settings.get("api_key", ""),
+    }
+    payload["ai_settings"] = stored
+
+
+def _rerun() -> None:
+    """Trigger a logical refresh without calling the deprecated rerun API."""
+
+    st.session_state["ai_settings_revision"] = (
+        st.session_state.get("ai_settings_revision", 0) + 1
+    )
+
+
+def _render_ai_settings(payload: Dict[str, Any], container: Optional[DeltaGenerator] = None) -> None:
+    target = container or st
+    settings = st.session_state.setdefault("ai_settings", _payload_to_ai_settings(payload))
+    st.session_state.setdefault("ai_api_key", settings.get("api_key", ""))
+
+    provider_options = list(AI_PROVIDER_OPTIONS)
+    if settings.get("provider") not in provider_options:
+        provider_options.append(settings.get("provider"))
+
+    current_provider = settings.get("provider", "OpenAI")
+    try:
+        provider_index = provider_options.index(current_provider)
+    except ValueError:
+        provider_index = 0
+
+    ml_defaults = [
+        ML_METHOD_LABELS.get(code, code.replace("_", " ").title())
+        for code in settings.get("ml_methods", ["linear_regression"])
+    ]
+    feature_defaults = [
+        GEN_AI_FEATURE_LABELS.get(code, code.replace("_", " ").title())
+        for code in settings.get("generative_features", ["summary"])
+    ]
+
+    form = target.form("ai_settings_form")
+    with form:
+        enabled = form.checkbox(
+            "Enable AI Enhancements",
+            value=bool(settings.get("enabled", False)),
+            help="Toggle machine-learning forecasts and generative commentary.",
+        )
+        provider = form.selectbox(
+            "Provider",
+            provider_options,
+            index=provider_index,
+            help="Select the API provider powering generative insights.",
+        )
+        model = form.text_input(
+            "Model",
+            value=settings.get("model", "gpt-4"),
+            help="Name of the deployed model (for example `gpt-4o-mini`).",
+        )
+        horizon = form.number_input(
+            "Forecast Horizon (years)",
+            min_value=0,
+            max_value=20,
+            value=int(settings.get("forecast_horizon", 3)),
+            step=1,
+            help="Number of additional years used for machine-learning revenue forecasts.",
+        )
+
+        ml_selection = form.multiselect(
+            "Machine Learning Methods",
+            list(ML_METHOD_LABELS.values()),
+            default=ml_defaults,
+            help="Choose algorithms applied to projected net revenue.",
+        )
+        feature_selection = form.multiselect(
+            "Generative Features",
+            list(GEN_AI_FEATURE_LABELS.values()),
+            default=feature_defaults,
+            help="Pick the narrative focus areas generated by the AI summary.",
+        )
+        api_key = form.text_input(
+            "API Key",
+            value=st.session_state.get("ai_api_key", ""),
+            type="password",
+            help="Store your provider API key securely. Keys are retained only for the current session.",
+        )
+
+        submitted = form.form_submit_button("Save AI Configuration")
+
+    if submitted:
+        ml_codes = [ML_LABEL_TO_CODE.get(label, label.replace(" ", "_").lower()) for label in ml_selection]
+        feature_codes = [
+            GEN_AI_LABEL_TO_CODE.get(label, label.replace(" ", "_").lower())
+            for label in feature_selection
+        ]
+
+        settings.update(
+            {
+                "enabled": enabled,
+                "provider": provider,
+                "model": model.strip() or "gpt-4",
+                "forecast_horizon": int(horizon),
+                "ml_methods": ml_codes or ["linear_regression"],
+                "generative_features": feature_codes or ["summary"],
+                "api_key": api_key.strip(),
+            }
+        )
+        st.session_state["ai_settings"] = settings
+        st.session_state["ai_api_key"] = settings.get("api_key", "")
+        _ai_settings_to_payload(settings, payload)
+        st.success("AI configuration updated. Rerunning the model with the new settings.")
+        _rerun()
 
 
 def _section_header(title: str, key: str, *, level: str = "subheader") -> bool:
@@ -780,6 +948,10 @@ def _ensure_scenario_payload(
     else:
         results_payload = cashflow_model(inputs_copy)
 
+    results_payload["ai_settings"] = copy.deepcopy(
+        st.session_state.get("ai_settings", DEFAULT_AI_SETTINGS)
+    )
+
     payloads[scenario_name] = (inputs_copy, results_payload)
     st.session_state["scenario_payloads"] = payloads
     return inputs_copy, results_payload
@@ -793,6 +965,9 @@ def _set_default(key: str, value):
 source_label = "Default inputs"
 inputs = default_inputs()
 st.caption(f"Using assumptions from: {source_label}")
+
+ai_payload = st.session_state.setdefault("ai_payload", {})
+ai_payload.setdefault("ai_settings", dict(DEFAULT_AI_SETTINGS))
 
 projection_defaults = ProjectionSettings(
     start_year=inputs.timeline.start_year,
@@ -1204,6 +1379,7 @@ page_tabs = st.tabs(
         "Sensitivity Analyses",
         "Scenario / Ifs",
         "Break-Even & Payback",
+        "AI & ML Configuration",
     ]
 )
 
@@ -1940,6 +2116,7 @@ user_inputs = WTEMasterInputs(
 )
 
 results = cashflow_model(user_inputs)
+results["ai_settings"] = copy.deepcopy(st.session_state.get("ai_settings", DEFAULT_AI_SETTINGS))
 
 summary, summary_ann, summary_cumulative, production_annual_series = build_summary_tables(
     user_inputs, results
@@ -2554,6 +2731,18 @@ with page_tabs[10]:
     st.write(
         "Background Information includes CAPEX requirements and feedstock demand assumptions. "
         "Use the input table above to refine the data that underpins break-even and payback outputs."
+    )
+
+
+with page_tabs[11]:
+    st.subheader("AI & ML Configuration")
+    _render_ai_settings(ai_payload)
+    st.markdown(
+        """
+        Configure machine-learning forecasts and generative summaries for the workbook and dashboards.
+        Provide your preferred provider, model name, optional API credentials, and choose the analytics
+        features to activate. Settings are stored per session and shared across scenarios and exports.
+        """
     )
 
 st.subheader("Model Outputs Snapshot")

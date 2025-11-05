@@ -63,6 +63,18 @@ section directly in the browser:
 5. All edits cascade instantly through the dashboards, statements, and
    analytics tabs, so you can validate the impact without reloading the app.
 
+### AI & ML configuration
+
+Open the **AI & ML Configuration** tab to control optional advanced tooling:
+
+- Switch on machine-learning forecasts and choose the algorithms that extend
+  net revenue projections beyond the deterministic model horizon.
+- Select the generative insight features you want in narrative summaries and
+  provide the API provider/model combination that powers them.
+- Store an API key for the current session and adjust the forecast horizon; the
+  settings are persisted in Streamlit session state and included with scenario
+  exports so downstream tools can reuse the configuration.
+
 ### Troubleshooting Streamlit deployment
 
 If the app fails to start with an error about missing packages (for example
