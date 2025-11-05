@@ -190,7 +190,7 @@ def _editable_table(
                 if new_row_df is not None:
                     combined = pd.concat([base, new_row_df], ignore_index=True)
                     _update_table_state(key, combined)
-                    st.experimental_rerun()
+                    base = combined
         with ctrl_cols[1]:
             if base.empty:
                 st.write("No rows to remove")
@@ -205,7 +205,7 @@ def _editable_table(
                 if st.button("Remove row", key=f"remove_{key}"):
                     trimmed = base.drop(base.index[remove_idx]).reset_index(drop=True)
                     _update_table_state(key, trimmed)
-                    st.experimental_rerun()
+                    base = trimmed
     elif allow_row_controls and not edit_enabled:
         st.caption("Enable edit mode to add or remove rows.")
 
@@ -929,12 +929,10 @@ with page_tabs[0]:
             _reset_scalar_values(SCALAR_DEFAULTS)
             _reset_table_group(TABLE_DEFAULTS, mode="defaults")
             st.success("Defaults restored.")
-            st.experimental_rerun()
         if col_md2.button("Clean start", key="clean_start"):
             _reset_scalar_values(SCALAR_CLEAN_START)
             _reset_table_group(TABLE_DEFAULTS, mode="clean")
             st.success("Workspace cleared.")
-            st.experimental_rerun()
         if col_md3.button("Save current as custom", key="save_custom_defaults"):
             st.session_state["custom_scalar_defaults"] = {
                 key: st.session_state.get(key, value) for key, value in SCALAR_DEFAULTS.items()
@@ -949,7 +947,6 @@ with page_tabs[0]:
                 for key, df in st.session_state.get("custom_table_defaults", {}).items():
                     _update_table_state(key, df)
                 st.success("Loaded custom defaults.")
-                st.experimental_rerun()
 
     with st.expander("Yearly increment helper", expanded=False):
         available_tables = {
@@ -1003,7 +1000,6 @@ with page_tabs[0]:
                             f"Applied {increment_pct:.2f}% annual increment to "
                             f"{TABLE_LABELS.get(table_key, column)}"
                         )
-                        st.experimental_rerun()
 
     proj_edit = _section_header("Projection Horizon", "projection_horizon")
     col_proj1, col_proj2, col_proj3 = st.columns(3)
