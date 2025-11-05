@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional
+import copy
+from dataclasses import dataclass, replace
+from io import BytesIO
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 _REQUIRED_PACKAGES = ("numpy", "pandas", "streamlit")
@@ -311,6 +313,172 @@ def _irr(values: Iterable[float]) -> float:
 
 def _npv(rate: float, values: Iterable[float]) -> float:
     return float(sum(cf / ((1 + rate) ** t) for t, cf in enumerate(values)))
+
+
+def _scenario_multiplier(value: Any) -> float:
+    """Normalise scenario adjustments expressed as decimals or percentages."""
+
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if abs(multiplier) > 1.0:
+        multiplier /= 100.0
+    return multiplier
+
+
+def _build_summary_tables(
+    inputs: WTEMasterInputs,
+    results: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Assemble the period, annual, and cumulative summary tables for exports."""
+
+    energy = results["energy"]
+    revenue = results["rev"]
+    capex_total = results["capex"]["total"]
+    opex_total = results["opex"]["total_opex"]
+    tax_cash = results["tax"]["cash_tax"]
+    debt = results["debt"]
+
+    periods = np.arange(inputs.timeline.n)
+    years_axis = inputs.timeline.start_year + (periods // inputs.timeline.periods_per_year)
+
+    summary = pd.DataFrame(
+        {
+            "Period": periods + 1,
+            "Calendar Year": years_axis,
+            "Tonnes": energy["tonnes"],
+            "Net MWh": energy["net_mwh"],
+            "Total revenue": revenue["total_revenue"],
+            "Total opex": opex_total,
+            "EBITDA": results["ebitda"],
+            "CFADS": results["cfads"],
+            "Debt service": debt["debt_service"],
+            "Equity cash flow": results["equity_cf"],
+            "Capex": capex_total,
+            "Debt balance": debt["balance"],
+            "Tax": tax_cash,
+        }
+    )
+
+    summary_ann = summary.groupby("Calendar Year", as_index=False).agg(
+        {
+            "Tonnes": "sum",
+            "Net MWh": "sum",
+            "Total revenue": "sum",
+            "Total opex": "sum",
+            "EBITDA": "sum",
+            "CFADS": "sum",
+            "Debt service": "sum",
+            "Equity cash flow": "sum",
+            "Capex": "sum",
+            "Tax": "sum",
+        }
+    )
+
+    summary_cumulative = summary.copy()
+    for col in ["Total revenue", "Total opex", "Equity cash flow", "Capex", "CFADS"]:
+        summary_cumulative[f"Cumulative {col}"] = summary_cumulative[col].cumsum()
+
+    production_annual_series = _annualise(energy["tonnes"], inputs.timeline.periods_per_year)
+
+    return summary, summary_ann, summary_cumulative, production_annual_series
+
+
+def _ensure_scenario_payload(
+    scenario_name: str,
+    base_inputs: WTEMasterInputs,
+    scenario_df: pd.DataFrame,
+    base_results: Optional[Dict[str, Any]] = None,
+) -> Tuple[WTEMasterInputs, Dict[str, Any]]:
+    """Return cached inputs/results for the requested scenario, building if missing."""
+
+    payloads: Dict[str, Tuple[WTEMasterInputs, Dict[str, Any]]] = st.session_state.setdefault(
+        "scenario_payloads", {}
+    )
+    if scenario_name in payloads:
+        return payloads[scenario_name]
+
+    inputs_copy = copy.deepcopy(base_inputs)
+
+    if scenario_name != "Base Case":
+        if scenario_df is not None and not scenario_df.empty and "Scenario" in scenario_df.columns:
+            candidates = (
+                scenario_df["Scenario"].astype(str).str.strip().reset_index(drop=True)
+            )
+            if scenario_name in candidates.values:
+                row_idx = candidates[candidates == scenario_name].index[0]
+                row = scenario_df.iloc[row_idx]
+            else:
+                row = None
+        else:
+            row = None
+
+        if row is not None:
+            ppa_adj = _scenario_multiplier(row.get("PPA adjustment", 0.0))
+            gate_adj = _scenario_multiplier(row.get("Gate fee adjustment", 0.0))
+            capex_adj = _scenario_multiplier(row.get("CAPEX adjustment", 0.0))
+
+            if ppa_adj:
+                current = inputs_copy.revenue.ppa_price_usd_per_mwh
+                inputs_copy.revenue.ppa_price_usd_per_mwh = current * (1 + ppa_adj)
+            if gate_adj:
+                current = inputs_copy.revenue.gate_fee_usd_per_t
+                inputs_copy.revenue.gate_fee_usd_per_t = current * (1 + gate_adj)
+            if capex_adj:
+                inputs_copy.costs.capex_total_usd *= 1 + capex_adj
+                if inputs_copy.costs.capex_items:
+                    adjusted_items = [
+                        replace(item, amount=item.amount * (1 + capex_adj))
+                        for item in inputs_copy.costs.capex_items
+                    ]
+                    inputs_copy.costs.capex_items = adjusted_items
+        else:
+            st.info(
+                f"Scenario '{scenario_name}' is not defined in the configuration table; using base inputs."
+            )
+
+    if scenario_name == "Base Case" and base_results is not None:
+        results_payload = copy.deepcopy(base_results)
+    else:
+        results_payload = cashflow_model(inputs_copy)
+
+    payloads[scenario_name] = (inputs_copy, results_payload)
+    st.session_state["scenario_payloads"] = payloads
+    return inputs_copy, results_payload
+
+
+def _generate_excel_bytes(
+    model_inputs: WTEMasterInputs,
+    results: Dict[str, Any],
+    scenario_name: str,
+) -> bytes:
+    """Create an Excel workbook containing the key model outputs."""
+
+    summary, summary_ann, summary_cumulative, _ = _build_summary_tables(model_inputs, results)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame({"Scenario": [scenario_name]}).to_excel(
+            writer, sheet_name="Scenario", index=False
+        )
+        summary.to_excel(writer, sheet_name="Period Summary", index=False)
+        summary_ann.to_excel(writer, sheet_name="Annual Summary", index=False)
+        summary_cumulative.to_excel(writer, sheet_name="Cumulative", index=False)
+        pd.DataFrame(results["energy"]).to_excel(writer, sheet_name="Energy", index=False)
+        pd.DataFrame(results["rev"]).to_excel(writer, sheet_name="Revenue", index=False)
+        pd.DataFrame(results["opex"]).to_excel(writer, sheet_name="Opex", index=False)
+        pd.DataFrame(results["capex"]).to_excel(writer, sheet_name="Capex", index=False)
+        pd.DataFrame(results["debt"]).to_excel(writer, sheet_name="Debt", index=False)
+        pd.DataFrame({"Equity cash flow": results["equity_cf"]}).to_excel(
+            writer, sheet_name="Equity CF", index=False
+        )
+        pd.DataFrame({"CFADS": results["cfads"]}).to_excel(
+            writer, sheet_name="CFADS", index=False
+        )
+
+    output.seek(0)
+    return output.getvalue()
 
 
 def _set_default(key: str, value):
@@ -1421,6 +1589,10 @@ user_inputs = WTEMasterInputs(
 
 results = cashflow_model(user_inputs)
 
+summary, summary_ann, summary_cumulative, production_annual_series = _build_summary_tables(
+    user_inputs, results
+)
+
 energy = results["energy"]
 revenue = results["rev"]
 capex_total = results["capex"]["total"]
@@ -1429,26 +1601,17 @@ tax_cash = results["tax"]["cash_tax"]
 depr_total = results["depr"]["total"]
 debt = results["debt"]
 
-periods = np.arange(user_inputs.timeline.n)
-years_axis = user_inputs.timeline.start_year + (periods // user_inputs.timeline.periods_per_year)
-
-summary = pd.DataFrame(
-    {
-        "Period": periods + 1,
-        "Calendar Year": years_axis,
-        "Tonnes": energy["tonnes"],
-        "Net MWh": energy["net_mwh"],
-        "Total revenue": revenue["total_revenue"],
-        "Total opex": opex_total,
-        "EBITDA": results["ebitda"],
-        "CFADS": results["cfads"],
-        "Debt service": debt["debt_service"],
-        "Equity cash flow": results["equity_cf"],
-        "Capex": capex_total,
-        "Debt balance": debt["balance"],
-        "Tax": tax_cash,
-    }
-)
+base_signature = repr(user_inputs)
+prev_signature = st.session_state.get("base_signature")
+if prev_signature != base_signature:
+    st.session_state["base_signature"] = base_signature
+    st.session_state["input_snapshot"] = copy.deepcopy(user_inputs)
+    st.session_state["results_snapshot"] = copy.deepcopy(results)
+    st.session_state["scenario_payloads"] = {}
+    st.session_state.pop("excel_bytes_map", None)
+else:
+    st.session_state["input_snapshot"] = copy.deepcopy(user_inputs)
+    st.session_state["results_snapshot"] = copy.deepcopy(results)
 
 
 
@@ -1486,27 +1649,6 @@ annual_revenue = _annualise(revenue["total_revenue"], user_inputs.timeline.perio
 annual_ebitda = _annualise(results["ebitda"], user_inputs.timeline.periods_per_year)
 annual_equity_cf = _annualise(results["equity_cf"], user_inputs.timeline.periods_per_year)
 annual_capex = _annualise(capex_total, user_inputs.timeline.periods_per_year)
-
-production_annual_series = _annualise(results["energy"]["tonnes"], user_inputs.timeline.periods_per_year)
-
-summary_ann = summary.groupby("Calendar Year", as_index=False).agg(
-    {
-        "Tonnes": "sum",
-        "Net MWh": "sum",
-        "Total revenue": "sum",
-        "Total opex": "sum",
-        "EBITDA": "sum",
-        "CFADS": "sum",
-        "Debt service": "sum",
-        "Equity cash flow": "sum",
-        "Capex": "sum",
-        "Tax": "sum",
-    }
-)
-
-summary_cumulative = summary.copy()
-for col in ["Total revenue", "Total opex", "Equity cash flow", "Capex", "CFADS"]:
-    summary_cumulative[f"Cumulative {col}"] = summary_cumulative[col].cumsum()
 
 
 
@@ -1879,27 +2021,48 @@ with page_tabs[9]:
         edit_enabled=scenario_edit,
     )
 
+    scenario_signature = scenario_config.to_csv(index=False) if not scenario_config.empty else ""
+    if st.session_state.get("scenario_signature") != scenario_signature:
+        st.session_state["scenario_signature"] = scenario_signature
+        st.session_state["scenario_payloads"] = {}
+        st.session_state.pop("excel_bytes_map", None)
+
+    base_snapshot = st.session_state.get("input_snapshot", copy.deepcopy(user_inputs))
+    base_results_snapshot = st.session_state.get("results_snapshot", copy.deepcopy(results))
+    _ensure_scenario_payload("Base Case", base_snapshot, scenario_config, base_results_snapshot)
+
+    scenario_names: List[str] = []
+    if not scenario_config.empty and "Scenario" in scenario_config.columns:
+        scenario_names = [
+            name
+            for name in scenario_config["Scenario"].astype(str).str.strip()
+            if name and name.lower() != "nan"
+        ]
+
     st.subheader("Scenario Tool Configuration")
     scenario_results: List[Dict[str, float]] = []
-    if scenario_config.empty:
-        st.info("Add scenarios to compare outcomes.")
-    else:
-        for _, row in scenario_config.iterrows():
-            try:
-                ppa_adj = float(row.get("PPA adjustment", 0.0))
-                gate_adj = float(row.get("Gate fee adjustment", 0.0))
-                capex_adj = float(row.get("CAPEX adjustment", 0.0))
-            except (TypeError, ValueError):
-                continue
-            adjusted_cashflow = equity_cf * (1 + ppa_adj + gate_adj - capex_adj)
+    if scenario_names:
+        for scenario_name in scenario_names:
+            scenario_model, scenario_payload = _ensure_scenario_payload(
+                scenario_name,
+                base_snapshot,
+                scenario_config,
+                base_results_snapshot,
+            )
             scenario_results.append(
                 {
-                    "Scenario": row.get("Scenario", ""),
-                    "Equity IRR": _irr(adjusted_cashflow),
-                    "NPV": _npv(user_inputs.finance.discount_rate, adjusted_cashflow),
+                    "Scenario": scenario_name,
+                    "Equity IRR": scenario_payload["irr_eq"],
+                    "Project IRR": scenario_payload["irr_proj"],
+                    "NPV": _npv(
+                        scenario_model.finance.discount_rate,
+                        scenario_payload["equity_cf"],
+                    ),
                 }
             )
         st.dataframe(pd.DataFrame(scenario_results).round(4), use_container_width=True)
+    else:
+        st.info("Add scenarios to compare outcomes.")
 
     st.subheader("Scenario Comparison")
     if scenario_results:
@@ -1907,6 +2070,56 @@ with page_tabs[9]:
         st.bar_chart(comparison_chart)
     else:
         st.info("Populate scenarios to view comparisons.")
+
+    st.subheader("Excel Model Download")
+    download_options = ["Base Case"]
+    for name in scenario_names:
+        if name not in download_options:
+            download_options.append(name)
+    selected_scenario = st.selectbox(
+        "Scenario to export",
+        download_options,
+        key="excel_download_scenario",
+    )
+    download_container = st.container()
+
+    snapshot = st.session_state.get("input_snapshot", copy.deepcopy(user_inputs))
+    model, scenario_payload_results = _ensure_scenario_payload(
+        selected_scenario,
+        snapshot,
+        scenario_config,
+        st.session_state.get("results_snapshot", copy.deepcopy(results)),
+    )
+    st.session_state["model_results"] = (model, scenario_payload_results)
+
+    excel_map: Dict[str, bytes] = st.session_state.setdefault("excel_bytes_map", {})
+    excel_bytes = excel_map.get(selected_scenario)
+
+    model.scenario = selected_scenario
+
+    with download_container:
+        if not excel_bytes:
+            if st.button("Prepare Excel Model", key=f"prepare_excel_{selected_scenario.lower()}"):
+                with st.spinner("Preparing Excel workbook..."):
+                    excel_bytes = _generate_excel_bytes(model, scenario_payload_results, selected_scenario)
+                excel_map[selected_scenario] = excel_bytes
+                st.session_state.excel_bytes_map = excel_map
+        if excel_bytes:
+            st.download_button(
+                "Download Excel Model",
+                data=excel_bytes,
+                file_name="Ecommerce_Financial_Model.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            if st.button(
+                "Clear Prepared Excel",
+                key=f"clear_excel_{selected_scenario.lower()}",
+            ):
+                excel_map.pop(selected_scenario, None)
+                st.session_state.excel_bytes_map = excel_map
+                excel_bytes = None
+        if not excel_bytes:
+            st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
 
 
 
