@@ -110,121 +110,124 @@ class RevenueAssumptions:
 
     streams: List[RevenueStream] = field(default_factory=list)
 
-    def _find_stream(
+    def _match_stream(
         self,
         driver: str,
         *,
-        name_contains: Optional[str] = None,
-        fallback_index: Optional[int] = None,
+        keywords: Optional[Sequence[str]] = None,
     ) -> Optional[RevenueStream]:
+        driver = driver.lower()
+        keyword_list = [k.lower() for k in (keywords or []) if k]
         for stream in self.streams:
-            if stream.driver == driver:
-                if name_contains and name_contains.lower() not in stream.name.lower():
-                    continue
+            if stream.driver.lower() != driver:
+                continue
+            if keyword_list and not any(k in stream.name.lower() for k in keyword_list):
+                continue
+            return stream
+        for stream in self.streams:
+            if stream.driver.lower() == driver:
                 return stream
-        if fallback_index is not None and len(self.streams) > fallback_index:
-            return self.streams[fallback_index]
         return None
+
+    def _ensure_stream(self, name: str, driver: str, *, keywords: Optional[Sequence[str]] = None) -> RevenueStream:
+        stream = self._match_stream(driver, keywords=keywords or [name])
+        if stream is None:
+            stream = RevenueStream(name=name, driver=driver, price_curve=PriceCurve(base=0.0))
+            self.streams.append(stream)
+        return stream
 
     @property
     def ppa_price_usd_per_mwh(self) -> float:
-        stream = self._find_stream("net_mwh", fallback_index=0)
+        stream = self._match_stream("net_mwh", keywords=("ppa", "electricity"))
         return float(stream.price_curve.base) if stream else 0.0
 
     @ppa_price_usd_per_mwh.setter
     def ppa_price_usd_per_mwh(self, value: float) -> None:
-        stream = self._find_stream("net_mwh", fallback_index=0)
-        if stream is None:
-            self.streams.append(RevenueStream(name="PPA", driver="net_mwh", price_curve=PriceCurve(base=value)))
-        else:
-            stream.price_curve.base = value
+        stream = self._ensure_stream("PPA", "net_mwh", keywords=("ppa", "electricity"))
+        stream.price_curve.base = value
 
     @property
     def ppa_escalation(self) -> float:
-        stream = self._find_stream("net_mwh", fallback_index=0)
+        stream = self._match_stream("net_mwh", keywords=("ppa", "electricity"))
         return float(stream.price_curve.annual_escalation) if stream else 0.0
 
     @ppa_escalation.setter
     def ppa_escalation(self, value: float) -> None:
-        stream = self._find_stream("net_mwh", fallback_index=0)
-        if stream:
-            stream.price_curve.annual_escalation = value
+        stream = self._ensure_stream("PPA", "net_mwh", keywords=("ppa", "electricity"))
+        stream.price_curve.annual_escalation = value
 
     @property
     def gate_fee_usd_per_t(self) -> float:
-        stream = self._find_stream("tonnes", name_contains="gate", fallback_index=1)
+        stream = self._match_stream("tonnes", keywords=("gate", "tipping"))
         return float(stream.price_curve.base) if stream else 0.0
 
     @gate_fee_usd_per_t.setter
     def gate_fee_usd_per_t(self, value: float) -> None:
-        stream = self._find_stream("tonnes", name_contains="gate", fallback_index=1)
-        if stream is None:
-            self.streams.append(RevenueStream(name="Gate fees", driver="tonnes", price_curve=PriceCurve(base=value)))
-        elif stream:
-            stream.price_curve.base = value
+        stream = self._ensure_stream("Gate fees", "tonnes", keywords=("gate", "tipping"))
+        stream.price_curve.base = value
 
     @property
     def gate_fee_escalation(self) -> float:
-        stream = self._find_stream("tonnes", name_contains="gate", fallback_index=1)
+        stream = self._match_stream("tonnes", keywords=("gate", "tipping"))
         return float(stream.price_curve.annual_escalation) if stream else 0.0
 
     @gate_fee_escalation.setter
     def gate_fee_escalation(self, value: float) -> None:
-        stream = self._find_stream("tonnes", name_contains="gate", fallback_index=1)
-        if stream:
-            stream.price_curve.annual_escalation = value
+        stream = self._ensure_stream("Gate fees", "tonnes", keywords=("gate", "tipping"))
+        stream.price_curve.annual_escalation = value
 
     @property
     def heat_price_usd_per_mwh(self) -> float:
-        stream = self._find_stream("heat_mwh")
+        stream = self._match_stream("heat_mwh", keywords=("heat", "steam"))
         return float(stream.price_curve.base) if stream else 0.0
 
     @heat_price_usd_per_mwh.setter
     def heat_price_usd_per_mwh(self, value: float) -> None:
-        stream = self._find_stream("heat_mwh")
-        if stream is None:
-            self.streams.append(RevenueStream(name="Heat offtake", driver="heat_mwh", price_curve=PriceCurve(base=value)))
-        else:
-            stream.price_curve.base = value
+        stream = self._ensure_stream("Heat offtake", "heat_mwh", keywords=("heat", "steam"))
+        stream.price_curve.base = value
 
-    def _byproduct_stream(self, keyword: str, fallback_index: Optional[int] = None) -> Optional[RevenueStream]:
-        return self._find_stream("tonnes", name_contains=keyword, fallback_index=fallback_index)
+    def _byproduct_streams(self) -> List[RevenueStream]:
+        return [
+            stream
+            for stream in self.streams
+            if stream.driver.lower() == "tonnes" and "gate" not in stream.name.lower()
+        ]
+
+    def _ensure_byproduct(self, name: str, keyword: str) -> RevenueStream:
+        stream = self._match_stream("tonnes", keywords=(keyword,))
+        if stream is None:
+            stream = RevenueStream(name=name, driver="tonnes", price_curve=PriceCurve(base=0.0))
+            self.streams.append(stream)
+        return stream
 
     @property
     def metal_recovery_usd_per_t(self) -> float:
-        stream = self._byproduct_stream("metal", fallback_index=2)
+        stream = self._match_stream("tonnes", keywords=("metal",))
         return float(stream.price_curve.base) if stream else 0.0
 
     @metal_recovery_usd_per_t.setter
     def metal_recovery_usd_per_t(self, value: float) -> None:
-        stream = self._byproduct_stream("metal", fallback_index=2)
-        if stream is None:
-            self.streams.append(RevenueStream(name="Metals", driver="tonnes", price_curve=PriceCurve(base=value)))
-        else:
-            stream.price_curve.base = value
+        stream = self._ensure_byproduct("Metals", "metal")
+        stream.price_curve.base = value
 
     @property
     def ash_revenue_usd_per_t(self) -> float:
-        stream = self._byproduct_stream("ash")
+        stream = self._match_stream("tonnes", keywords=("ash",))
         return float(stream.price_curve.base) if stream else 0.0
 
     @ash_revenue_usd_per_t.setter
     def ash_revenue_usd_per_t(self, value: float) -> None:
-        stream = self._byproduct_stream("ash")
-        if stream is None:
-            self.streams.append(RevenueStream(name="Ash", driver="tonnes", price_curve=PriceCurve(base=value)))
-        else:
-            stream.price_curve.base = value
+        stream = self._ensure_byproduct("Ash", "ash")
+        stream.price_curve.base = value
 
     @property
     def other_escalation(self) -> float:
-        stream = self._byproduct_stream("", fallback_index=2)
-        return float(stream.price_curve.annual_escalation) if stream else 0.0
+        streams = self._byproduct_streams()
+        return float(streams[0].price_curve.annual_escalation) if streams else 0.0
 
     @other_escalation.setter
     def other_escalation(self, value: float) -> None:
-        stream = self._byproduct_stream("", fallback_index=2)
-        if stream:
+        for stream in self._byproduct_streams():
             stream.price_curve.annual_escalation = value
 
 
@@ -250,10 +253,13 @@ class WorkingCapitalAssumptions:
 
     receivable_days: float = 45.0
     prepaid_days: float = 30.0
+    prepaid_absolute: float = 0.0
     other_current_asset_pct_revenue: float = 0.0
+    other_asset_absolute: float = 0.0
     inventory_days: float = 20.0
     payable_days: float = 45.0
     other_current_liability_pct_opex: float = 0.0
+    accrued_expense_absolute: float = 0.0
 
 
 @dataclass

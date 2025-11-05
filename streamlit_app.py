@@ -31,6 +31,7 @@ from wte_model import (
     RevenueAssumptions,
     TechAssumptions,
     Timeline,
+    WorkingCapitalAssumptions,
     WTEMasterInputs,
     cashflow_model,
     default_inputs,
@@ -76,6 +77,58 @@ def _parse_capex_profile(text: str, fallback: Optional[List[float]]) -> Optional
         st.info("Capex profile normalised to sum to 1.0.")
         values = [v / total for v in values]
     return values
+
+
+def _working_capital_from_tables(
+    accounts_df: Optional[pd.DataFrame],
+    inventory_df: Optional[pd.DataFrame],
+    defaults,
+):
+    """Map the editable working-capital tables into model assumptions."""
+
+    cfg = replace(defaults)
+
+    def _iter_rows(df: Optional[pd.DataFrame]):
+        if df is None:
+            return []
+        if df.empty or "Metric" not in df.columns or "Value" not in df.columns:
+            return []
+        return df[["Metric", "Value"]].itertuples(index=False, name=None)
+
+    for metric_raw, value in _iter_rows(accounts_df):
+        metric = str(metric_raw).strip().lower()
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if "receivable" in metric:
+            if "day" in metric:
+                cfg.receivable_days = numeric
+        elif "prepaid" in metric:
+            if "day" in metric:
+                cfg.prepaid_days = numeric
+            else:
+                cfg.prepaid_absolute = numeric
+                cfg.prepaid_days = 0.0
+        elif "other" in metric and "asset" in metric:
+            cfg.other_asset_absolute = numeric
+            cfg.other_current_asset_pct_revenue = 0.0
+
+    for metric_raw, value in _iter_rows(inventory_df):
+        metric = str(metric_raw).strip().lower()
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if "inventory" in metric and "day" in metric:
+            cfg.inventory_days = numeric
+        elif "payable" in metric and "day" in metric:
+            cfg.payable_days = numeric
+        elif "accrued" in metric or "expense" in metric:
+            cfg.accrued_expense_absolute = numeric
+            cfg.other_current_liability_pct_opex = 0.0
+
+    return cfg
 
 
 def _update_table_state(key: str, df: pd.DataFrame) -> None:
@@ -677,6 +730,7 @@ def _build_summary_tables(
     energy = results["energy"]
     revenue = results["rev"]
     capex_total = results["capex"]["total"]
+    investment_total = results["capex"].get("investment_total", capex_total)
     opex_total = results["opex"]["total_opex"]
     tax_cash = results["tax"]["cash_tax"]
     debt = results["debt"]
@@ -696,7 +750,7 @@ def _build_summary_tables(
             "CFADS": results["cfads"],
             "Debt service": debt["debt_service"],
             "Equity cash flow": results["equity_cf"],
-            "Capex": capex_total,
+            "Capex": investment_total,
             "Debt balance": debt["balance"],
             "Tax": tax_cash,
         }
@@ -1929,6 +1983,12 @@ revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery
 revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
 revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
 
+wc_cfg = _working_capital_from_tables(
+    accounts_receivable,
+    inventory_payable,
+    inputs.finance.working_capital,
+)
+
 user_inputs = WTEMasterInputs(
     timeline=Timeline(
         years=projection.years,
@@ -1966,6 +2026,7 @@ user_inputs = WTEMasterInputs(
         depr_years=int(st.session_state["depr_years"]),
         working_cap_days=int(st.session_state["working_cap_days"]),
         discount_rate=float(st.session_state["discount_rate"]),
+        working_capital=wc_cfg,
     ),
 )
 
@@ -1978,6 +2039,7 @@ summary, summary_ann, summary_cumulative, production_annual_series = _build_summ
 energy = results["energy"]
 revenue = results["rev"]
 capex_total = results["capex"]["total"]
+investment_total = results["capex"].get("investment_total", capex_total)
 opex_total = results["opex"]["total_opex"]
 tax_cash = results["tax"]["cash_tax"]
 depr_total = results["depr"]["total"]
@@ -2024,13 +2086,13 @@ owner_cf = equity_cf * owner_share_pct / 100.0
 investor_irr = _irr(investor_cf)
 owner_irr = _irr(owner_cf)
 
-project_cashflows = -capex_total + (revenue["total_revenue"] - opex_total - tax_cash)
+project_cashflows = -investment_total + (revenue["total_revenue"] - opex_total - tax_cash)
 project_npv = _npv(user_inputs.finance.discount_rate, project_cashflows)
 
 annual_revenue = _annualise(revenue["total_revenue"], user_inputs.timeline.periods_per_year)
 annual_ebitda = _annualise(results["ebitda"], user_inputs.timeline.periods_per_year)
 annual_equity_cf = _annualise(results["equity_cf"], user_inputs.timeline.periods_per_year)
-annual_capex = _annualise(capex_total, user_inputs.timeline.periods_per_year)
+annual_investment = _annualise(investment_total, user_inputs.timeline.periods_per_year)
 
 
 
@@ -2131,7 +2193,7 @@ with page_tabs[4]:
         {
             "Category": ["CAPEX", "OPEX", "Debt service"],
             "Value": [
-                float(capex_total.sum()),
+                float(investment_total.sum()),
                 float(results["opex"]["total_opex"].sum()),
                 float(debt["debt_service"].sum()),
             ],
@@ -2142,8 +2204,8 @@ with page_tabs[4]:
     st.subheader("Capital Expenditure and Debt")
     capex_debt = pd.DataFrame(
         {
-            "Capex": _annualise(capex_total, user_inputs.timeline.periods_per_year),
-            "Debt draws": _annualise(debt["debt_draws"], user_inputs.timeline.periods_per_year),
+            "Investment": _annualise(investment_total, user_inputs.timeline.periods_per_year),
+            "Debt funding": _annualise(debt["funding_total"], user_inputs.timeline.periods_per_year),
         }
     )
     st.bar_chart(capex_debt)
@@ -2212,7 +2274,7 @@ with page_tabs[6]:
     st.subheader("Monthly Statement of Financial Position")
     net_fixed_assets = np.cumsum(capex_total) - np.cumsum(depr_total)
     debt_balance = debt["balance"]
-    equity_balance = np.cumsum(-capex_total + debt["debt_draws"] + results["equity_cf"])
+    equity_balance = np.cumsum(-investment_total + debt["funding_total"] + results["equity_cf"])
     cash_balance = np.cumsum(results["equity_cf"])
     working_capital = np.full_like(net_fixed_assets, user_inputs.finance.working_cap_days)
     balance_sheet_monthly = pd.DataFrame(
@@ -2248,9 +2310,9 @@ with page_tabs[7]:
         {
             "Period": summary["Period"],
             "Operating cash flow": summary["CFADS"],
-            "Investing cash flow": -capex_total,
-            "Financing cash flow": debt["debt_draws"] - debt["debt_service"] + equity_cf,
-            "Net cash flow": summary["CFADS"] - capex_total + debt["debt_draws"] - debt["debt_service"] + equity_cf,
+            "Investing cash flow": -investment_total,
+            "Financing cash flow": debt["funding_total"] - debt["debt_service"] + equity_cf,
+            "Net cash flow": summary["CFADS"] - investment_total + debt["funding_total"] - debt["debt_service"] + equity_cf,
             "Cumulative equity CF": summary_cumulative["Cumulative Equity cash flow"],
         }
     )
@@ -2554,7 +2616,7 @@ with page_tabs[10]:
 
     st.subheader("Break-Even Results Background")
     break_even_revenue = annual_revenue.sum()
-    break_even_costs = annual_capex.sum() + annual_equity_cf.abs().sum()
+    break_even_costs = annual_investment.sum() + annual_equity_cf.abs().sum()
     st.metric("Breakeven revenue", f"${break_even_revenue:,.0f}")
     st.metric("Breakeven cost base", f"${break_even_costs:,.0f}")
 

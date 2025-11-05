@@ -235,6 +235,7 @@ def debt_schedule(
     total_balance = np.zeros(timeline.n)
     total_fees = np.zeros(timeline.n)
     needs_cfads = False
+    total_funding = np.zeros(timeline.n)
 
     for facility in facilities:
         draws = _facility_draws(facility, capex_total, timeline, total_capex)
@@ -248,6 +249,7 @@ def debt_schedule(
         total_balance += schedule["balance"]
         total_fees += schedule["fees"]
         needs_cfads = needs_cfads or bool(schedule["needs_cfads"])
+        total_funding += schedule["draws"] + schedule["interest_capitalised"]
 
     return {
         "facilities": facility_results,
@@ -259,6 +261,7 @@ def debt_schedule(
         "balance": total_balance,
         "fees": total_fees,
         "needs_cfads": needs_cfads,
+        "funding_total": total_funding,
     }
 
 
@@ -277,11 +280,20 @@ def working_capital_block(
     variable = opex.get("variable_total", opex_total)
 
     receivables = revenue_total * (cfg.receivable_days / 365.0)
-    prepaid = opex_total * (cfg.prepaid_days / 365.0)
+    prepaid = (
+        opex_total * (cfg.prepaid_days / 365.0)
+        + np.full(periods, float(cfg.prepaid_absolute), dtype=float)
+    )
     inventory = variable * (cfg.inventory_days / 365.0)
     payables = opex_total * (cfg.payable_days / 365.0)
-    other_assets = revenue_total * cfg.other_current_asset_pct_revenue
-    other_liabilities = opex_total * cfg.other_current_liability_pct_opex
+    other_assets = (
+        revenue_total * cfg.other_current_asset_pct_revenue
+        + np.full(periods, float(cfg.other_asset_absolute), dtype=float)
+    )
+    other_liabilities = (
+        opex_total * cfg.other_current_liability_pct_opex
+        + np.full(periods, float(cfg.accrued_expense_absolute), dtype=float)
+    )
 
     net_wc = receivables + prepaid + inventory + other_assets - payables - other_liabilities
     cash_effect = np.concatenate(([net_wc[0]], np.diff(net_wc)))

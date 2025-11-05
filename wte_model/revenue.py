@@ -82,8 +82,6 @@ def revenue_block(inp: WTEMasterInputs, energy: Dict[str, np.ndarray]) -> Dict[s
         else:
             other_revenue += revenue
 
-    other_revenue += total_revenue - (energy_revenue + gate_revenue)
-
     return {
         "streams": streams_data,
         "energy_revenue": energy_revenue,

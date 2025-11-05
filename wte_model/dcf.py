@@ -64,30 +64,41 @@ def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np
     ebitda = revenue["total_revenue"] - opex["total_opex"]
     depreciation_total = depr["total"]
 
+    wc = working_capital_block(inp, revenue, opex)
     debt = debt_schedule(inp, capex["total"])
 
-    for iteration in range(2):
+    max_iter = 10
+    tol = 1e-6
+    tax = None
+    cfads = None
+
+    for iteration in range(max_iter):
         interest_cash = debt["interest_cash"]
         taxable_income = ebitda - depreciation_total - interest_cash
         tax = tax_block(inp, taxable_income, revenue["total_revenue"], energy)
-        wc = working_capital_block(inp, revenue, opex)
         cfads = ebitda - tax["cash_tax"] - wc["cash_effect"]
 
-        if debt["needs_cfads"] and iteration == 0:
-            debt = debt_schedule(inp, capex["total"], cfads=cfads)
-            continue
-        break
+        if not debt["needs_cfads"]:
+            break
 
-    # Recompute with final debt schedule to ensure consistency
+        updated = debt_schedule(inp, capex["total"], cfads=cfads)
+        diff = np.max(np.abs(updated["debt_service"] - debt["debt_service"]))
+        debt = updated
+        if diff < tol:
+            break
+
+    # Ensure final cash flows align with converged debt schedule
     interest_cash = debt["interest_cash"]
     taxable_income = ebitda - depreciation_total - interest_cash
     tax = tax_block(inp, taxable_income, revenue["total_revenue"], energy)
-    wc = working_capital_block(inp, revenue, opex)
     cfads = ebitda - tax["cash_tax"] - wc["cash_effect"]
+
+    investment_total = capex["total"] + debt["interest_capitalised"]
+    debt_funding = debt["funding_total"]
 
     debt_service = debt["debt_service"]
     fees = debt["fees"]
-    equity_invest = capex["total"] - debt["debt_draws"]
+    equity_invest = investment_total - debt_funding
 
     withholding_rate = inp.finance.tax.withholding_rate
     equity_before_withholding = cfads - debt_service - fees - equity_invest
@@ -96,13 +107,16 @@ def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np
 
     project_cash = revenue["total_revenue"] - opex["total_opex"] - tax["cash_tax"] - wc["cash_effect"]
 
-    proj_cf = list(project_cash - capex["total"])
+    proj_cf = list(project_cash - investment_total)
     irr_proj = _irr(proj_cf)
     irr_eq = _irr(list(equity_cf))
 
     coverage = coverage_ratios(debt, cfads, project_cash, timeline, inp.finance.discount_rate)
     debt["llcr"] = coverage["llcr"]
     debt["plcr"] = coverage["plcr"]
+
+    capex["interest_capitalised"] = debt["interest_capitalised"]
+    capex["investment_total"] = investment_total
 
     return {
         "energy": energy,
