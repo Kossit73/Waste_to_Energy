@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import re
 from dataclasses import dataclass, replace
 from io import BytesIO
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -21,7 +22,7 @@ if _missing:
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pandas.api.types import is_numeric_dtype
+from pandas.api.types import is_bool_dtype, is_integer_dtype, is_numeric_dtype
 from streamlit.delta_generator import DeltaGenerator
 
 from wte_model import (
@@ -176,6 +177,8 @@ def _editable_table(
     allow_row_controls: bool = True,
     new_row_factory: Optional[Callable[[], pd.DataFrame]] = None,
     edit_enabled: bool = True,
+    row_edit_controls: bool = False,
+    row_label_field: Optional[str] = None,
 ) -> pd.DataFrame:
     base = _ensure_state_df(key, data.copy())
 
@@ -214,18 +217,79 @@ def _editable_table(
             "Defaults are read-only. Toggle the **Edit** checkbox to change cell values or manage rows."
         )
 
+    editor_disabled = (not edit_enabled) or row_edit_controls
+
     edited = st.data_editor(
         base,
         key=f"editor_{key}",
         num_rows="dynamic",
         use_container_width=True,
         column_config=column_config or {},
-        disabled=not edit_enabled,
+        disabled=editor_disabled,
     )
-    if edit_enabled:
+    if edit_enabled and not row_edit_controls:
         _update_table_state(key, edited)
         return edited
-    return base
+
+    if row_edit_controls and edit_enabled:
+        st.caption(
+            "Update individual rows below. Saved changes refresh the table immediately."
+        )
+        table = st.session_state[key].copy()
+        label_field = row_label_field
+        if label_field is None and not table.columns.empty:
+            label_field = table.columns[0]
+
+        for idx, row in table.iterrows():
+            if label_field in table.columns:
+                descriptor = row.get(label_field, "")
+                descriptor = "" if pd.isna(descriptor) else descriptor
+                row_title = f"Row {idx + 1}: {descriptor}"
+            else:
+                row_title = f"Row {idx + 1}"
+
+            with st.expander(row_title, expanded=False):
+                with st.form(f"{key}_row_form_{idx}"):
+                    updated_values: Dict[str, Any] = {}
+                    for col in table.columns:
+                        cell_value = row[col]
+                        safe_col = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
+                        widget_key = f"{key}_row_{idx}_{safe_col}"
+
+                        if is_bool_dtype(table[col]):
+                            current_val = bool(cell_value)
+                            new_val = st.checkbox(col, value=current_val, key=widget_key)
+                        elif is_numeric_dtype(table[col]):
+                            default_val = 0.0 if pd.isna(cell_value) else float(cell_value)
+                            if is_integer_dtype(table[col]):
+                                new_val = st.number_input(
+                                    col,
+                                    value=int(default_val),
+                                    step=1,
+                                    key=widget_key,
+                                )
+                                new_val = int(new_val)
+                            else:
+                                new_val = st.number_input(
+                                    col,
+                                    value=default_val,
+                                    step=0.01,
+                                    format="%.6f",
+                                    key=widget_key,
+                                )
+                        else:
+                            default_str = "" if pd.isna(cell_value) else str(cell_value)
+                            new_val = st.text_input(col, value=default_str, key=widget_key)
+                        updated_values[col] = new_val
+
+                    submitted = st.form_submit_button("Save row", use_container_width=True)
+                    if submitted:
+                        for column_name, val in updated_values.items():
+                            table.at[idx, column_name] = val
+                        _update_table_state(key, table)
+                        st.success("Row updated.")
+
+    return st.session_state[key]
 
 
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
@@ -1049,6 +1113,8 @@ with page_tabs[0]:
             "Value": st.column_config.NumberColumn("Value", help="Values are captured in native units or percent."),
         },
         edit_enabled=global_edit,
+        row_edit_controls=True,
+        row_label_field="Parameter",
     )
 
     initial_edit = _section_header("Initial Investment Inputs", "initial_investment")
@@ -1061,6 +1127,8 @@ with page_tabs[0]:
             "Life (years)": st.column_config.NumberColumn("Life (years)", min_value=1, step=1),
         },
         edit_enabled=initial_edit,
+        row_edit_controls=True,
+        row_label_field="Item",
     )
 
     schedule = _compute_initial_investment_schedule(initial_investment)
@@ -1084,6 +1152,8 @@ with page_tabs[1]:
             "Escalation (%)": st.column_config.NumberColumn("Escalation (%)", format="%0.2f"),
         },
         edit_enabled=revenue_edit,
+        row_edit_controls=True,
+        row_label_field="Revenue stream",
     )
 
     st.subheader("Production Assumptions")
@@ -1098,6 +1168,8 @@ with page_tabs[1]:
                 "Throughput (t)": st.column_config.NumberColumn("Throughput (t)", format="%0.0f"),
             },
             edit_enabled=prod_annual_edit,
+            row_edit_controls=True,
+            row_label_field="Year",
         )
     with prod_tabs[1]:
         prod_monthly_edit = _section_header("Monthly production", "production_monthly")
@@ -1109,6 +1181,8 @@ with page_tabs[1]:
                 "Throughput (t)": st.column_config.NumberColumn("Throughput (t)", format="%0.0f"),
             },
             edit_enabled=prod_monthly_edit,
+            row_edit_controls=True,
+            row_label_field="Month",
         )
 
     tech_edit = _section_header("Technology Inputs", "technology_inputs")
@@ -1261,6 +1335,8 @@ with page_tabs[2]:
             "Residue disposal": st.column_config.NumberColumn("Residue disposal", format="%0.0f"),
         },
         edit_enabled=direct_cost_edit,
+        row_edit_controls=True,
+        row_label_field="Month",
     )
 
     staff_edit = _section_header("Staff Costs (Monthly)", "staff_monthly")
@@ -1272,6 +1348,8 @@ with page_tabs[2]:
             "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
         },
         edit_enabled=staff_edit,
+        row_edit_controls=True,
+        row_label_field="Role",
     )
 
     other_opex_edit = _section_header("Other Opex (Monthly)", "other_opex_monthly")
@@ -1283,6 +1361,8 @@ with page_tabs[2]:
             "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
         },
         edit_enabled=other_opex_edit,
+        row_edit_controls=True,
+        row_label_field="Category",
     )
 
     st.subheader("Working Capital Inputs")
@@ -1297,6 +1377,8 @@ with page_tabs[2]:
                 "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
             },
             edit_enabled=receivable_edit,
+            row_edit_controls=True,
+            row_label_field="Metric",
         )
     with col_wc2:
         payable_edit = _section_header("Inventory & payables", "inventory_payable", level="markdown")
@@ -1308,6 +1390,8 @@ with page_tabs[2]:
                 "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
             },
             edit_enabled=payable_edit,
+            row_edit_controls=True,
+            row_label_field="Metric",
         )
 
     cost_edit = _section_header("Cost Structure Controls", "cost_structure")
@@ -1490,6 +1574,8 @@ with page_tabs[3]:
             "Grace (years)": st.column_config.NumberColumn("Grace (years)", step=1),
         },
         edit_enabled=loan_edit,
+        row_edit_controls=True,
+        row_label_field="Facility",
     )
 
     tax_edit = _section_header("Tax Schedule", "tax_schedule")
@@ -1503,6 +1589,8 @@ with page_tabs[3]:
             "Notes": st.column_config.TextColumn("Notes"),
         },
         edit_enabled=tax_edit,
+        row_edit_controls=True,
+        row_label_field="Tax",
     )
 
     inflation_edit = _section_header("Inflation Schedule", "inflation_schedule")
@@ -1514,6 +1602,8 @@ with page_tabs[3]:
             "Inflation rate (%)": st.column_config.NumberColumn("Inflation rate (%)", format="%0.2f"),
         },
         edit_enabled=inflation_edit,
+        row_edit_controls=True,
+        row_label_field="Category",
     )
 
     risk_edit = _section_header("Risk Schedule", "risk_schedule")
@@ -1527,6 +1617,8 @@ with page_tabs[3]:
             "Mitigation": st.column_config.TextColumn("Mitigation"),
         },
         edit_enabled=risk_edit,
+        row_edit_controls=True,
+        row_label_field="Risk",
     )
 
 
@@ -1910,6 +2002,8 @@ with page_tabs[8]:
             "High": st.column_config.NumberColumn("High", format="%0.2f"),
         },
         edit_enabled=sensitivity_edit,
+        row_edit_controls=True,
+        row_label_field="Driver",
     )
 
     st.subheader("Simulation Results")
@@ -1960,6 +2054,8 @@ with page_tabs[8]:
             "Std dev": st.column_config.NumberColumn("Std dev", format="%0.2f"),
         },
         edit_enabled=monte_edit,
+        row_edit_controls=True,
+        row_label_field="Variable",
     )
     if not monte_carlo_config.empty:
         st.write(
@@ -1979,6 +2075,8 @@ with page_tabs[9]:
             "Variable": st.column_config.TextColumn("Variable"),
         },
         edit_enabled=goal_edit,
+        row_edit_controls=True,
+        row_label_field="Target metric",
     )
 
     st.subheader("Goal Seek Results")
@@ -2020,6 +2118,8 @@ with page_tabs[9]:
             "CAPEX adjustment": st.column_config.NumberColumn("CAPEX adjustment", format="%0.2f"),
         },
         edit_enabled=scenario_edit,
+        row_edit_controls=True,
+        row_label_field="Scenario",
     )
 
     scenario_signature = scenario_config.to_csv(index=False) if not scenario_config.empty else ""
@@ -2134,6 +2234,8 @@ with page_tabs[10]:
             "Value": st.column_config.NumberColumn("Value", format="%0.2f"),
         },
         edit_enabled=break_even_edit,
+        row_edit_controls=True,
+        row_label_field="Input",
     )
 
     st.subheader("Break-Even Results Background")
@@ -2151,6 +2253,8 @@ with page_tabs[10]:
             "Preferred name": st.column_config.TextColumn("Preferred name"),
         },
         edit_enabled=parameter_edit,
+        row_edit_controls=True,
+        row_label_field="Parameter",
     )
     st.dataframe(parameter_naming, use_container_width=True)
 
