@@ -233,61 +233,104 @@ def _editable_table(
 
     if row_edit_controls and edit_enabled:
         st.caption(
-            "Update individual rows below. Saved changes refresh the table immediately."
+            "Click **Edit** beside a row to adjust the values line by line. Saved changes "
+            "immediately refresh the schedules."
         )
-        table = st.session_state[key].copy()
+        table = st.session_state[key].copy().reset_index(drop=True)
         label_field = row_label_field
         if label_field is None and not table.columns.empty:
             label_field = table.columns[0]
 
-        for idx, row in table.iterrows():
+        active_key = f"{key}_active_row"
+        active_row = st.session_state.get(active_key)
+        if isinstance(active_row, int) and active_row >= len(table):
+            st.session_state.pop(active_key, None)
+            active_row = None
+
+        if table.empty:
+            st.session_state.pop(active_key, None)
+            st.info("No rows available. Add a row above to begin editing.")
+        else:
+            for idx, row in table.iterrows():
+                if label_field in table.columns:
+                    descriptor = row.get(label_field, "")
+                    descriptor = "" if pd.isna(descriptor) else str(descriptor)
+                    title = f"Row {idx + 1}: {descriptor}"
+                else:
+                    title = f"Row {idx + 1}"
+
+                row_cols = st.columns([5, 1])
+                row_cols[0].markdown(f"**{title}**")
+                is_active = active_row == idx
+                edit_label = "Editing" if is_active else "Edit row"
+                if row_cols[1].button(
+                    edit_label,
+                    key=f"{key}_edit_btn_{idx}",
+                    disabled=is_active,
+                    use_container_width=True,
+                ):
+                    st.session_state[active_key] = idx
+
+        active_row = st.session_state.get(active_key)
+        if isinstance(active_row, int) and 0 <= active_row < len(table):
+            row = table.loc[active_row]
             if label_field in table.columns:
                 descriptor = row.get(label_field, "")
-                descriptor = "" if pd.isna(descriptor) else descriptor
-                row_title = f"Row {idx + 1}: {descriptor}"
+                descriptor = "" if pd.isna(descriptor) else str(descriptor)
+                active_title = f"Row {active_row + 1}: {descriptor}"
             else:
-                row_title = f"Row {idx + 1}"
+                active_title = f"Row {active_row + 1}"
+            st.info(f"Editing {active_title}")
+            with st.form(f"{key}_row_form_active"):
+                updated_values: Dict[str, Any] = {}
+                for col in table.columns:
+                    cell_value = row[col]
+                    safe_col = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
+                    widget_key = f"{key}_row_active_{safe_col}"
 
-            with st.expander(row_title, expanded=False):
-                with st.form(f"{key}_row_form_{idx}"):
-                    updated_values: Dict[str, Any] = {}
-                    for col in table.columns:
-                        cell_value = row[col]
-                        safe_col = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
-                        widget_key = f"{key}_row_{idx}_{safe_col}"
-
-                        if is_bool_dtype(table[col]):
-                            current_val = bool(cell_value)
-                            new_val = st.checkbox(col, value=current_val, key=widget_key)
-                        elif is_numeric_dtype(table[col]):
-                            default_val = 0.0 if pd.isna(cell_value) else float(cell_value)
-                            if is_integer_dtype(table[col]):
-                                new_val = st.number_input(
-                                    col,
-                                    value=int(default_val),
-                                    step=1,
-                                    key=widget_key,
-                                )
-                                new_val = int(new_val)
-                            else:
-                                new_val = st.number_input(
-                                    col,
-                                    value=default_val,
-                                    step=0.01,
-                                    format="%.6f",
-                                    key=widget_key,
-                                )
+                    if is_bool_dtype(table[col]):
+                        current_val = bool(cell_value)
+                        new_val = st.checkbox(col, value=current_val, key=widget_key)
+                    elif is_numeric_dtype(table[col]):
+                        default_val = 0.0 if pd.isna(cell_value) else float(cell_value)
+                        if is_integer_dtype(table[col]):
+                            new_val = st.number_input(
+                                col,
+                                value=int(default_val),
+                                step=1,
+                                key=widget_key,
+                            )
+                            new_val = int(new_val)
                         else:
-                            default_str = "" if pd.isna(cell_value) else str(cell_value)
-                            new_val = st.text_input(col, value=default_str, key=widget_key)
-                        updated_values[col] = new_val
+                            new_val = st.number_input(
+                                col,
+                                value=default_val,
+                                step=0.01,
+                                format="%.6f",
+                                key=widget_key,
+                            )
+                    else:
+                        default_str = "" if pd.isna(cell_value) else str(cell_value)
+                        new_val = st.text_input(col, value=default_str, key=widget_key)
+                    updated_values[col] = new_val
 
-                    submitted = st.form_submit_button("Save row", use_container_width=True)
-                    if submitted:
-                        for column_name, val in updated_values.items():
-                            table.at[idx, column_name] = val
-                        _update_table_state(key, table)
-                        st.success("Row updated.")
+                action_cols = st.columns(2)
+                save_clicked = action_cols[0].form_submit_button(
+                    "Save changes", use_container_width=True
+                )
+                cancel_clicked = action_cols[1].form_submit_button(
+                    "Cancel", use_container_width=True
+                )
+
+                if save_clicked:
+                    for column_name, val in updated_values.items():
+                        table.at[active_row, column_name] = val
+                    _update_table_state(key, table)
+                    st.session_state.pop(active_key, None)
+                    st.success("Row updated.")
+                elif cancel_clicked:
+                    st.session_state.pop(active_key, None)
+                    st.info("Row edit cancelled.")
 
     return st.session_state[key]
 
@@ -979,9 +1022,9 @@ with page_tabs[0]:
             """
             1. **Enable edit mode** – toggle the *Edit* checkbox for the section you want to
                update. Inputs remain read-only until editing is enabled.
-            2. **Edit or extend rows** – after enabling edit mode, click any cell in the default
-               table to overwrite its value, and use the *Add row*/*Remove row* buttons above each
-               schedule when you need to change the row count.
+            2. **Edit or extend rows** – once edit mode is active use the *Add row*/*Remove row*
+               buttons to adjust the schedule length, then press **Edit row** beside the line you
+               want to update and submit the form to save changes.
             3. **Manage default sets** – restore the shipped defaults, start with empty tables,
                or save/load your own presets from the *Manage defaults & state* panel.
             4. **Apply structured growth** – the *Yearly increment helper* lets you apply a
