@@ -1379,7 +1379,6 @@ page_tabs = st.tabs(
         "Sensitivity Analyses",
         "Scenario / Ifs",
         "Break-Even & Payback",
-        "AI & ML Configuration",
     ]
 )
 
@@ -1427,6 +1426,16 @@ with page_tabs[0]:
                 for key, df in st.session_state.get("custom_table_defaults", {}).items():
                     _update_table_state(key, df)
                 st.success("Loaded custom defaults.")
+
+    st.subheader("AI & ML Configuration")
+    _render_ai_settings(ai_payload)
+    st.markdown(
+        """
+        Configure machine-learning forecasts and generative summaries for the workbook and dashboards.
+        Provide your preferred provider, model name, optional API credentials, and choose the analytics
+        features to activate. Settings are stored per session and shared across scenarios and exports.
+        """
+    )
 
     proj_edit = _section_header("Projection Horizon", "projection_horizon")
     col_proj1, col_proj2, col_proj3 = st.columns(3)
@@ -2731,18 +2740,6 @@ with page_tabs[10]:
     st.write(
         "Background Information includes CAPEX requirements and feedstock demand assumptions. "
         "Use the input table above to refine the data that underpins break-even and payback outputs."
-    )
-
-
-with page_tabs[11]:
-    st.subheader("AI & ML Configuration")
-    _render_ai_settings(ai_payload)
-    st.markdown(
-        """
-        Configure machine-learning forecasts and generative summaries for the workbook and dashboards.
-        Provide your preferred provider, model name, optional API credentials, and choose the analytics
-        features to activate. Settings are stored per session and shared across scenarios and exports.
-        """
     )
 
 st.subheader("Model Outputs Snapshot")

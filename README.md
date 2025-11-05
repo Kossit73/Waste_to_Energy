@@ -65,7 +65,9 @@ section directly in the browser:
 
 ### AI & ML configuration
 
-Open the **AI & ML Configuration** tab to control optional advanced tooling:
+Within the *Input Landing* tab, just above the projection horizon controls,
+expand the **AI & ML Configuration** section to manage optional advanced
+tooling:
 
 - Switch on machine-learning forecasts and choose the algorithms that extend
   net revenue projections beyond the deterministic model horizon.
