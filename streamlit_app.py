@@ -726,6 +726,24 @@ page_tabs = st.tabs(
 
 
 with page_tabs[0]:
+    with st.expander("Editing guide", expanded=False):
+        st.markdown(
+            """
+            1. **Enable edit mode** – toggle the *Edit* checkbox for the section you want to
+               update. Inputs remain read-only until editing is enabled.
+            2. **Adjust rows as needed** – once in edit mode, use the *Add row* and *Remove row*
+               buttons above each table to manage its contents before typing directly into the
+               cells.
+            3. **Manage default sets** – restore the shipped defaults, start with empty tables,
+               or save/load your own presets from the *Manage defaults & state* panel.
+            4. **Apply structured growth** – the *Yearly increment helper* lets you apply a
+               compound annual change to any numeric column while the relevant section is in
+               edit mode.
+            5. **Review downstream impact** – every edit flows automatically into the dashboards,
+               statements, and analytics tabs so you can validate changes immediately.
+            """
+        )
+
     with st.expander("Manage defaults & state", expanded=False):
         col_md1, col_md2, col_md3 = st.columns(3)
         if col_md1.button("Restore defaults", key="restore_defaults"):

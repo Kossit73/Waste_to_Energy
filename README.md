@@ -42,6 +42,24 @@ the horizontal tabs to configure projection settings, edit inputs, review
 metrics, and run sensitivities. A CSV export button lets you download the
 calculated cash-flow table at any time.
 
+### Editing the default figures
+
+The workspace ships with illustrative assumptions but you can tailor every
+section directly in the browser:
+
+1. Toggle the **Edit** checkbox that appears in each section header to unlock
+   its number inputs and data tables.
+2. Use the **Add row**/**Remove row** buttons that appear above editable tables
+   (while in edit mode) to manage table length before updating cell values.
+3. Open the **Manage defaults & state** panel on the *Input Landing* tab to
+   restore the packaged defaults, clear all tables, or save/load your own
+   custom preset.
+4. The **Yearly increment helper** can apply a compound annual change to any
+   numeric column when the related section is in edit mode, speeding up bulk
+   adjustments.
+5. All edits cascade instantly through the dashboards, statements, and
+   analytics tabs, so you can validate the impact without reloading the app.
+
 ## Package overview
 
 - `wte_model/inputs.py` – dataclasses representing the model inputs.
