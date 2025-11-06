@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import math
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 _REQUIRED_PACKAGES = ("numpy", "pandas", "streamlit")
@@ -42,7 +43,11 @@ from wte_model import (
     cashflow_model,
     default_inputs,
     generate_excel_bytes,
+    goal_seek,
+    run_monte_carlo,
+    run_sensitivity,
 )
+from wte_model.scenario import DistributionSpec, MonteCarloConfig
 
 
 AI_PROVIDER_OPTIONS = ("OpenAI", "Azure OpenAI", "Anthropic", "Vertex AI", "Custom")
@@ -279,6 +284,436 @@ def _parse_series_cell(value: Any) -> Optional[List[float]]:
             continue
         series.append(float(coerced))
     return series or None
+
+
+def _normalise_label(label: str) -> str:
+    cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(label).strip().lower())
+    return cleaned.strip("_")
+
+
+PARAMETER_PATH_ALIASES: Dict[str, str] = {
+    "ppa_price": "revenue.ppa_price_usd_per_mwh",
+    "ppa_price_usd_per_mwh": "revenue.ppa_price_usd_per_mwh",
+    "ppa_escalation": "revenue.ppa_escalation",
+    "gate_fee": "revenue.gate_fee_usd_per_t",
+    "gate_fee_usd_per_t": "revenue.gate_fee_usd_per_t",
+    "gate_fee_escalation": "revenue.gate_fee_escalation",
+    "heat_price": "revenue.heat_price_usd_per_mwh",
+    "heat_price_usd_per_mwh": "revenue.heat_price_usd_per_mwh",
+    "electricity_price_per_kwh": "revenue.ppa_price_usd_per_mwh",
+    "electricity_price_usd_kwh": "revenue.ppa_price_usd_per_mwh",
+    "metal_recovery": "revenue.metal_recovery_usd_per_t",
+    "ash_revenue": "revenue.ash_revenue_usd_per_t",
+    "capex": "costs.capex_total_usd",
+    "capex_total": "costs.capex_total_usd",
+    "capex_total_usd": "costs.capex_total_usd",
+    "fixed_om": "costs.fixed_om_usd_pa",
+    "fixed_o_m": "costs.fixed_om_usd_pa",
+    "fixed_om_usd_pa": "costs.fixed_om_usd_pa",
+    "variable_om": "costs.variable_om_usd_per_t",
+    "variable_o_m": "costs.variable_om_usd_per_t",
+    "variable_om_usd_per_t": "costs.variable_om_usd_per_t",
+    "opex_per_ton_of_waste": "costs.variable_om_usd_per_t",
+    "landfill_disposal": "costs.landfill_disposal_usd_per_t",
+    "landfill_disposal_usd_per_t": "costs.landfill_disposal_usd_per_t",
+    "insurance_pct": "costs.insurance_pct_of_capex_pa",
+    "insurance_pct_of_capex_pa": "costs.insurance_pct_of_capex_pa",
+    "maintenance_pct": "costs.maintenance_pct_of_capex_pa",
+    "maintenance_pct_of_capex_pa": "costs.maintenance_pct_of_capex_pa",
+    "opex_escalation": "costs.opex_escalation",
+    "debt_ratio": "finance.debt_ratio",
+    "interest_rate": "finance.interest_rate",
+    "upfront_fee": "finance.upfront_fee_pct",
+    "upfront_fee_pct": "finance.upfront_fee_pct",
+    "tenor_years": "finance.tenor_years",
+    "grace_years": "finance.grace_years",
+    "discount_rate": "finance.discount_rate",
+    "tax_rate": "finance.tax_rate",
+    "corporate_tax_rate": "finance.tax_rate",
+    "working_cap_days": "finance.working_cap_days",
+    "depr_years": "finance.depr_years",
+    "availability": "tech.availability",
+    "plant_availability": "tech.availability",
+    "msw_tonnes_pa": "tech.msw_tonnes_pa",
+    "lhv_mj_per_kg": "tech.lhv_mj_per_kg",
+    "boiler_efficiency": "tech.boiler_efficiency",
+    "electrical_efficiency": "tech.electrical_efficiency",
+    "parasitic_load": "tech.parasitic_load_frac",
+}
+
+
+def _parameter_alias_map() -> Dict[str, str]:
+    alias_map = dict(PARAMETER_PATH_ALIASES)
+    df = st.session_state.get("parameter_naming")
+    if df is None or df.empty:
+        return alias_map
+    if "Parameter" not in df.columns or "Preferred name" not in df.columns:
+        return alias_map
+    for _, row in df.iterrows():
+        base_label = _normalise_label(row.get("Parameter", ""))
+        alias_label = _normalise_label(row.get("Preferred name", ""))
+        if not base_label or not alias_label:
+            continue
+        path = PARAMETER_PATH_ALIASES.get(base_label)
+        if path:
+            alias_map[alias_label] = path
+    return alias_map
+
+
+def _resolve_parameter_path(label: str, alias_map: Optional[Dict[str, str]] = None) -> Optional[str]:
+    if label is None:
+        return None
+    label = str(label).strip()
+    if not label:
+        return None
+    if "." in label or "[" in label:
+        return label
+    mapping = alias_map or _parameter_alias_map()
+    normalised = _normalise_label(label)
+    return mapping.get(normalised)
+
+
+def _read_input_value(root: WTEMasterInputs, path: str) -> Optional[float]:
+    try:
+        current: Any = root
+        for token in path.split("."):
+            if "[" in token and token.endswith("]"):
+                attr, idx = token[:-1].split("[")
+                current = getattr(current, attr)[int(idx)]
+            else:
+                current = getattr(current, token)
+        if isinstance(current, (int, float, np.number)):
+            return float(current)
+        return _coerce_float(current)
+    except Exception:
+        return None
+
+
+def _apply_adjustment(base_value: float, adjustment: Any) -> Optional[float]:
+    if adjustment is None:
+        return None
+    adj_value = _coerce_float(adjustment)
+    if adj_value is None:
+        return None
+    if abs(base_value) <= 1e-9:
+        return adj_value
+    if abs(adj_value) <= 1.5:
+        return float(base_value) * (1.0 + float(adj_value))
+    return float(adj_value)
+
+
+def _macro_indices_from_table(
+    table: Optional[pd.DataFrame],
+    timeline: Timeline,
+) -> Dict[str, List[float]]:
+    if table is None or table.empty:
+        return {}
+
+    macro: Dict[str, List[float]] = {}
+    horizon_years = max(1, int(timeline.years))
+    for _, row in table.iterrows():
+        category_raw = row.get("Category") or row.get("Label")
+        category = str(category_raw).strip() if category_raw is not None else ""
+        if not category:
+            continue
+        key = _normalise_label(category)
+        explicit_series = (
+            _parse_series_cell(row.get("Series"))
+            or _parse_series_cell(row.get("Inflation curve"))
+        )
+        if explicit_series:
+            values = [float(val) for val in explicit_series if _coerce_float(val) is not None]
+        else:
+            rate = _coerce_float(row.get("Inflation rate (%)"))
+            if rate is None:
+                continue
+            rate = rate / 100.0 if abs(rate) > 1.0 else rate
+            values = [float(rate)]
+        if not values:
+            continue
+        repeat = max(1, math.ceil(horizon_years / len(values)))
+        expanded = (values * repeat)[:horizon_years]
+        macro[key] = expanded
+    return macro
+
+
+def _risk_summary_from_table(table: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if table is None or table.empty:
+        return pd.DataFrame()
+    if "Probability (%)" not in table.columns or "Impact (USD)" not in table.columns:
+        return pd.DataFrame()
+    df = table.copy()
+    df["Probability (%)"] = df["Probability (%)"].apply(lambda v: _safe_float(v, 0.0))
+    df["Impact (USD)"] = df["Impact (USD)"].apply(lambda v: _safe_float(v, 0.0))
+    df["Expected loss (USD)"] = df["Probability (%)"] / 100.0 * df["Impact (USD)"]
+    return df
+
+
+METRIC_ALIASES: Dict[str, str] = {
+    "equity_irr": "irr_eq",
+    "project_irr": "irr_proj",
+    "dscr": "dscr_min",
+    "irr_eq": "irr_eq",
+    "irr_proj": "irr_proj",
+    "dscr_min": "dscr_min",
+}
+
+
+def _resolve_metric_code(label: str) -> Optional[str]:
+    if not label:
+        return None
+    normalised = _normalise_label(label)
+    return METRIC_ALIASES.get(normalised)
+
+
+def _sensitivity_results_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return pd.DataFrame(), warnings
+    if "Driver" not in table.columns:
+        warnings.append("Sensitivity table is missing a 'Driver' column.")
+        return pd.DataFrame(), warnings
+
+    alias_map = _parameter_alias_map()
+    records: List[Dict[str, Any]] = []
+
+    for _, row in table.iterrows():
+        driver_label = str(row.get("Driver", "")).strip()
+        if not driver_label:
+            continue
+        path = _resolve_parameter_path(driver_label, alias_map)
+        if not path:
+            warnings.append(f"Could not map driver '{driver_label}' to a model input.")
+            continue
+        base_value = _read_input_value(base_inputs, path)
+        if base_value is None:
+            warnings.append(f"Unable to read the current value for '{driver_label}'.")
+            continue
+
+        case_labels: List[str] = []
+        case_values: List[float] = []
+        for label_name in ("Low", "Base", "High"):
+            adjusted = _apply_adjustment(float(base_value), row.get(label_name))
+            if label_name == "Base" and adjusted is None:
+                adjusted = float(base_value)
+            if adjusted is None:
+                continue
+            case_labels.append(label_name)
+            case_values.append(float(adjusted))
+
+        if not case_values:
+            case_labels = ["Base"]
+            case_values = [float(base_value)]
+
+        unique_labels: List[str] = []
+        unique_values: List[float] = []
+        seen: Set[Tuple[str, float]] = set()
+        for label_name, value in zip(case_labels, case_values):
+            key = (label_name, round(float(value), 12))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_labels.append(label_name)
+            unique_values.append(float(value))
+
+        try:
+            outputs = run_sensitivity(base_inputs, path, unique_values)
+        except Exception as exc:
+            warnings.append(f"Sensitivity run for '{driver_label}' failed: {exc}")
+            continue
+
+        for label_name, result in zip(unique_labels, outputs):
+            records.append(
+                {
+                    "Driver": driver_label,
+                    "Case": label_name,
+                    "Test value": float(result.get("value", float("nan"))),
+                    "Equity IRR": float(result.get("irr_eq", float("nan"))),
+                    "Project IRR": float(result.get("irr_proj", float("nan"))),
+                    "DSCR minimum": float(result.get("dscr_min", float("nan"))),
+                }
+            )
+
+    return pd.DataFrame(records), warnings
+
+
+def _monte_carlo_config_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[Optional[MonteCarloConfig], List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return None, warnings
+    if "Variable" not in table.columns:
+        warnings.append("Monte Carlo table is missing a 'Variable' column.")
+        return None, warnings
+
+    alias_map = _parameter_alias_map()
+
+    iterations = 500
+    if "Iterations" in table.columns:
+        first_iter = table["Iterations"].dropna().iloc[0] if not table["Iterations"].dropna().empty else None
+        if first_iter is not None:
+            iterations = max(1, int(_safe_int(first_iter, iterations)))
+
+    seed: Optional[int] = None
+    if "Seed" in table.columns:
+        first_seed = table["Seed"].dropna().iloc[0] if not table["Seed"].dropna().empty else None
+        if first_seed is not None:
+            seed = int(_safe_int(first_seed, 0))
+
+    distributions: List[DistributionSpec] = []
+
+    for _, row in table.iterrows():
+        variable = str(row.get("Variable", "")).strip()
+        if not variable:
+            continue
+        path = _resolve_parameter_path(variable, alias_map)
+        if not path:
+            warnings.append(f"Could not map Monte Carlo variable '{variable}' to a model input.")
+            continue
+
+        dist_raw = row.get("Distribution", "normal")
+        dist = str(dist_raw).strip().lower() if isinstance(dist_raw, str) else "normal"
+        base_value = _read_input_value(base_inputs, path) or 0.0
+
+        params: Dict[str, float] = {}
+        minimum = _coerce_float(row.get("Min"))
+        maximum = _coerce_float(row.get("Max"))
+
+        if dist == "normal":
+            mean = _coerce_float(row.get("Mean"))
+            std = _coerce_float(row.get("Std dev"))
+            params["mean"] = float(base_value if mean is None else mean)
+            params["std"] = float(abs(base_value) * 0.05 if std is None else std)
+            if params["std"] <= 0:
+                params["std"] = max(1e-6, abs(params["mean"]) * 0.01)
+        elif dist == "triangular":
+            left = _coerce_float(row.get("Left"))
+            mode = _coerce_float(row.get("Mode"))
+            right = _coerce_float(row.get("Right"))
+            if mode is None:
+                mode = _coerce_float(row.get("Mean"))
+            if left is None or right is None:
+                spread = _coerce_float(row.get("Std dev"))
+                if spread is None:
+                    spread = abs(base_value) * 0.1 or 1.0
+                centre = mode if mode is not None else base_value
+                left = centre - spread
+                right = centre + spread
+            if mode is None:
+                mode = base_value
+            params.update({
+                "left": float(left),
+                "mode": float(mode),
+                "right": float(right),
+            })
+        elif dist == "uniform":
+            low = _coerce_float(row.get("Low"))
+            high = _coerce_float(row.get("High"))
+            if low is None or high is None:
+                width = _coerce_float(row.get("Std dev")) or abs(base_value) * 0.1 or 1.0
+                centre = _coerce_float(row.get("Mean")) or base_value
+                low = (centre or 0.0) - width
+                high = (centre or 0.0) + width
+            params.update({"low": float(low), "high": float(high)})
+        elif dist == "lognormal":
+            mean = _coerce_float(row.get("Mean"))
+            sigma = _coerce_float(row.get("Std dev"))
+            params["mean"] = float(math.log(max(base_value, 1e-6)) if mean is None else mean)
+            params["sigma"] = float(abs(base_value) * 0.05 if sigma is None else sigma)
+        else:
+            warnings.append(f"Unsupported distribution '{dist}' for variable '{variable}'.")
+            continue
+
+        distributions.append(
+            DistributionSpec(
+                path=path,
+                dist=dist,
+                params=params,
+                minimum=None if minimum is None else float(minimum),
+                maximum=None if maximum is None else float(maximum),
+            )
+        )
+
+    if not distributions:
+        warnings.append("No valid Monte Carlo distributions configured.")
+        return None, warnings
+
+    config = MonteCarloConfig(iterations=iterations, seed=seed, distributions=distributions)
+    return config, warnings
+
+
+def _goal_seek_results_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return pd.DataFrame(), warnings
+    if "Target metric" not in table.columns or "Variable" not in table.columns:
+        warnings.append("Goal seek table requires 'Target metric' and 'Variable' columns.")
+        return pd.DataFrame(), warnings
+
+    alias_map = _parameter_alias_map()
+    records: List[Dict[str, Any]] = []
+
+    for _, row in table.iterrows():
+        metric_label = str(row.get("Target metric", "")).strip()
+        metric_code = _resolve_metric_code(metric_label)
+        if not metric_code:
+            warnings.append(f"Unsupported target metric '{metric_label}'.")
+            continue
+
+        variable_label = str(row.get("Variable", "")).strip()
+        path = _resolve_parameter_path(variable_label, alias_map)
+        if not path:
+            warnings.append(f"Could not map goal seek variable '{variable_label}' to a model input.")
+            continue
+
+        target_value_raw = row.get("Target value")
+        target_value = _coerce_float(target_value_raw)
+        if target_value is None:
+            warnings.append(f"Target value for '{metric_label}' is not numeric.")
+            continue
+
+        base_value = _read_input_value(base_inputs, path)
+        if base_value is None:
+            warnings.append(f"Unable to read the current value for '{variable_label}'.")
+            continue
+
+        min_override = _coerce_float(row.get("Min"))
+        max_override = _coerce_float(row.get("Max"))
+        span = abs(base_value) if abs(base_value) > 1e-9 else max(abs(target_value), 1.0)
+        lower = float(min_override) if min_override is not None else float(base_value - span)
+        upper = float(max_override) if max_override is not None else float(base_value + span)
+        if lower == upper:
+            upper = lower + (abs(lower) or 1.0)
+
+        if lower > upper:
+            lower, upper = upper, lower
+
+        try:
+            result = goal_seek(base_inputs, path, metric_code, float(target_value), (lower, upper))
+        except Exception as exc:
+            warnings.append(f"Goal seek for '{metric_label}' failed: {exc}")
+            continue
+
+        records.append(
+            {
+                "Metric": metric_label,
+                "Variable": variable_label,
+                "Target": float(target_value),
+                "Solution": float(result.get("value", float("nan"))),
+                "Metric achieved": float(result.get(metric_code, float("nan"))),
+                "Bracket": f"[{lower:.4g}, {upper:.4g}]",
+            }
+        )
+
+    return pd.DataFrame(records), warnings
 
 
 def _table_differs(table: Optional[pd.DataFrame], template: Optional[pd.DataFrame]) -> bool:
@@ -2815,6 +3250,15 @@ with page_tabs[3]:
         label="Risk schedule",
     )
 
+    risk_summary = _risk_summary_from_table(risk_schedule)
+    if not risk_summary.empty:
+        st.markdown("**Risk exposure summary**")
+        st.dataframe(risk_summary.round(2), use_container_width=True)
+        expected_loss = risk_summary["Expected loss (USD)"].sum()
+        st.metric("Total expected loss", f"${expected_loss:,.0f}")
+    else:
+        st.info("Populate the risk table to calculate expected losses.")
+
 
 projection = ProjectionSettings(
     start_year=int(st.session_state["projection_start_year"]),
@@ -2898,6 +3342,10 @@ finance_inputs = FinanceAssumptions(
     discount_rate=float(st.session_state["discount_rate"]),
     working_capital=wc_cfg,
     debt_facilities=debt_facilities,
+)
+
+finance_inputs.macro_indices = _macro_indices_from_table(
+    inflation_schedule, timeline_cfg
 )
 
 if tax_table_changed:
@@ -3284,25 +3732,22 @@ with page_tabs[8]:
     )
 
     st.subheader("Simulation Results")
-    simulated = []
-    for _, row in sensitivity_config.iterrows():
-        driver = row.get("Driver", "")
-        try:
-            base_adj = float(row.get("Base", 0.0))
-            low_adj = float(row.get("Low", 0.0))
-            high_adj = float(row.get("High", 0.0))
-        except (TypeError, ValueError):
-            continue
-        simulated.append(
-            {
-                "Driver": driver,
-                "Low IRR": results["irr_eq"] + low_adj,
-                "Base IRR": results["irr_eq"] + base_adj,
-                "High IRR": results["irr_eq"] + high_adj,
-            }
+    sensitivity_results_df, sensitivity_warnings = _sensitivity_results_from_table(
+        sensitivity_config, user_inputs
+    )
+    for msg in sensitivity_warnings:
+        st.warning(msg)
+    if sensitivity_results_df.empty:
+        st.info("Add drivers to the sensitivity table to evaluate alternative cases.")
+    else:
+        st.dataframe(sensitivity_results_df.round(4), use_container_width=True)
+        pivot = sensitivity_results_df.pivot_table(
+            index="Driver",
+            columns="Case",
+            values="Equity IRR",
         )
-    sensitivity_results = pd.DataFrame(simulated)
-    st.dataframe(sensitivity_results.round(4), use_container_width=True)
+        if not pivot.empty:
+            st.line_chart(pivot)
 
     monte_edit = _section_header("Monte Carlo Simulation Configuration", "monte_carlo_config")
     monte_carlo_defaults_runtime = pd.DataFrame(
@@ -3339,11 +3784,25 @@ with page_tabs[8]:
         template=monte_carlo_defaults_runtime,
         label="Monte Carlo configuration",
     )
-    if not monte_carlo_config.empty:
-        st.write(
-            "Simulated IRR range (conceptual):",
-            f"{(results['irr_eq'] - 0.02) * 100:.2f}% to {(results['irr_eq'] + 0.02) * 100:.2f}%",
-        )
+    mc_config, mc_warnings = _monte_carlo_config_from_table(monte_carlo_config, user_inputs)
+    for msg in mc_warnings:
+        st.warning(msg)
+    if mc_config is None:
+        st.info("Provide at least one valid distribution to run the Monte Carlo simulation.")
+    else:
+        try:
+            mc_results = run_monte_carlo(user_inputs, mc_config)
+        except Exception as exc:
+            st.error(f"Monte Carlo simulation failed: {exc}")
+        else:
+            summary_df = pd.DataFrame(mc_results["summary"]).T
+            summary_df.index.name = "Metric"
+            st.markdown("**Monte Carlo summary (mean / percentiles)**")
+            st.dataframe(summary_df.round(4), use_container_width=True)
+            records_df = pd.DataFrame(mc_results.get("records", []))
+            if not records_df.empty:
+                st.markdown("**Sampled outcomes**")
+                st.dataframe(records_df.head(20).round(4), use_container_width=True)
 
 
 with page_tabs[9]:
@@ -3367,32 +3826,15 @@ with page_tabs[9]:
     )
 
     st.subheader("Goal Seek Results")
-    if goal_seek.empty:
+    goal_seek_results_df, goal_seek_warnings = _goal_seek_results_from_table(
+        goal_seek, user_inputs
+    )
+    for msg in goal_seek_warnings:
+        st.warning(msg)
+    if goal_seek_results_df.empty:
         st.info("Add goal seek configurations to calculate required adjustments.")
     else:
-        results_rows = []
-        for _, row in goal_seek.iterrows():
-            metric = row.get("Target metric", "")
-            try:
-                target_value = float(row.get("Target value", 0.0))
-            except (TypeError, ValueError):
-                target_value = 0.0
-            base_value = {
-                "Equity IRR": results["irr_eq"],
-                "Project IRR": results["irr_proj"],
-                "DSCR": float(np.nanmin(results["dscr"])) if results["dscr"].size else float("nan"),
-            }.get(metric, float("nan"))
-            delta = target_value - base_value if not np.isnan(base_value) else float("nan")
-            results_rows.append(
-                {
-                    "Metric": metric,
-                    "Target": target_value,
-                    "Base": base_value,
-                    "Delta": delta,
-                    "Suggested variable": row.get("Variable", ""),
-                }
-            )
-        st.dataframe(pd.DataFrame(results_rows).round(4), use_container_width=True)
+        st.dataframe(goal_seek_results_df.round(4), use_container_width=True)
 
     scenario_edit = _section_header("Scenario / Is Configuration", "scenario_config")
     scenario_config = _editable_table(
