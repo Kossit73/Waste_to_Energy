@@ -789,6 +789,11 @@ def _render_yearly_increment_helper(
         st.caption(
             "Propagate updated values or apply compound adjustments across the production horizon."
         )
+        st.markdown(
+            "The helper overwrites values starting from the first year. Set a **Base value** and use"
+            " the buttons to copy it forward or compound an annual percentage change; each subsequent"
+            " year applies the chosen growth or reduction to the previous year's amount."
+        )
 
         if table_df.empty:
             st.info("Add rows to the table to enable yearly increments.")
@@ -1018,6 +1023,79 @@ def _sync_production_annual_with_projection(projection: ProjectionSettings) -> N
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
     for key, value in values.items():
         st.session_state[key] = value
+
+
+def _resolve_production_throughput_profile(
+    projection: ProjectionSettings,
+) -> Optional[List[float]]:
+    """Return a per-period throughput profile derived from the annual schedule."""
+
+    table = st.session_state.get("production_annual")
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return None
+
+    if "Year" not in table.columns:
+        return None
+
+    if "Throughput (t)" in table.columns:
+        throughput_col: Optional[str] = "Throughput (t)"
+    else:
+        throughput_col = next(
+            (col for col in table.columns if col != "Year" and is_numeric_dtype(table[col])),
+            None,
+        )
+
+    if throughput_col is None:
+        return None
+
+    target_years = list(range(projection.start_year, projection.end_year + 1))
+    if not target_years:
+        return None
+
+    ordered = table.sort_values(by="Year", kind="stable", na_position="last").reset_index(drop=True)
+
+    default_value = float(st.session_state.get("msw_tonnes_pa", 0.0))
+    if "Throughput (t)" in production_annual_defaults.columns and not production_annual_defaults.empty:
+        template_value = production_annual_defaults["Throughput (t)"].iloc[0]
+        if pd.notna(template_value):
+            default_value = float(template_value)
+
+    values_by_year: Dict[int, float] = {}
+    for _, row in ordered.iterrows():
+        year_raw = row.get("Year")
+        if pd.isna(year_raw):
+            continue
+        try:
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            continue
+        raw_value = row.get(throughput_col)
+        if pd.isna(raw_value):
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        values_by_year[year] = value
+
+    if not values_by_year:
+        return None
+
+    annual_values: List[float] = []
+    last_value = default_value
+    for year in target_years:
+        value = values_by_year.get(year)
+        if value is None:
+            value = last_value
+        else:
+            last_value = value
+        annual_values.append(value)
+
+    if not annual_values:
+        return None
+
+    ppy = max(1, projection.periods_per_year)
+    return [value / ppy for value in annual_values]
 
 
 def _reset_table_group(defaults: Dict[str, pd.DataFrame], *, mode: str) -> None:
@@ -2334,6 +2412,7 @@ user_inputs = WTEMasterInputs(
         electrical_efficiency=float(st.session_state["electrical_efficiency"]),
         availability=float(st.session_state["availability"]),
         parasitic_load_frac=float(st.session_state["parasitic_load"]),
+        tonnes_profile=_resolve_production_throughput_profile(projection),
     ),
     revenue=revenue_inputs,
     costs=CostAssumptions(
