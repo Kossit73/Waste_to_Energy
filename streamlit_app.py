@@ -1755,6 +1755,9 @@ with page_tabs[1]:
         edit_enabled=commercial_edit,
     )
 
+    st.subheader("Model Outputs Snapshot")
+    st.dataframe(summary.head(12).round(2), use_container_width=True)
+
 
 with page_tabs[2]:
     direct_cost_edit = _section_header("Direct Costs (Monthly)", "direct_costs_monthly")
@@ -2781,9 +2784,6 @@ with page_tabs[10]:
         "Background Information includes CAPEX requirements and feedstock demand assumptions. "
         "Use the input table above to refine the data that underpins break-even and payback outputs."
     )
-
-st.subheader("Model Outputs Snapshot")
-st.dataframe(summary.head(12).round(2), use_container_width=True)
 
 st.info(
     "All navigation is organised horizontally across the page. Use the tabs to explore inputs, "
