@@ -732,6 +732,46 @@ def _handle_add_row_dialog(
     return None
 
 
+def _propagate_yearly_pattern(
+    series: pd.Series,
+    base_value: float,
+    *,
+    mode: str,
+    rate_pct: float = 0.0,
+) -> pd.Series:
+    """Return a series of propagated values that respects the original dtype."""
+
+    length = len(series)
+    if length == 0:
+        return series.copy()
+
+    mode = mode.lower().strip()
+    values: np.ndarray
+    if mode == "copy":
+        values = np.full(length, base_value, dtype=float)
+    else:
+        rate = rate_pct / 100.0
+        if mode == "increase":
+            factor = 1.0 + rate
+        elif mode == "decrease":
+            factor = 1.0 - rate
+        else:
+            raise ValueError(f"Unsupported propagation mode: {mode}")
+        if factor <= 0:
+            raise ValueError("Growth factor must be greater than zero.")
+        exponent = np.arange(length, dtype=float)
+        values = base_value * np.power(factor, exponent)
+
+    propagated = pd.Series(values, index=series.index, dtype=float)
+
+    dtype = series.dtype
+    if is_integer_dtype(dtype):
+        return propagated.round().astype(dtype)
+    if is_numeric_dtype(dtype):
+        return propagated.astype(float)
+    return propagated
+
+
 def _render_yearly_increment_helper(
     table_key: str,
     *,
@@ -784,7 +824,11 @@ def _render_yearly_increment_helper(
         with col_copy:
             if st.button("Copy forward", key=f"{table_key}_copy_forward"):
                 updated = table_df.copy()
-                updated[column] = base_value
+                updated[column] = _propagate_yearly_pattern(
+                    updated[column],
+                    base_value,
+                    mode="copy",
+                )
                 _update_table_state(table_key, updated)
                 table_df = updated
                 st.success(
@@ -799,16 +843,22 @@ def _render_yearly_increment_helper(
                 key=f"{table_key}_increase_pct",
             )
             if st.button("Apply increase", key=f"{table_key}_apply_increase"):
-                factor = 1 + increase_pct / 100.0
-                periods = len(table_df)
-                growth = np.array([factor**i for i in range(periods)], dtype=float)
                 updated = table_df.copy()
-                updated[column] = base_value * growth
-                _update_table_state(table_key, updated)
-                table_df = updated
-                st.success(
-                    f"Applied a {increase_pct:.2f}% annual increase across the production horizon for {label} ({column})."
-                )
+                try:
+                    updated[column] = _propagate_yearly_pattern(
+                        updated[column],
+                        base_value,
+                        mode="increase",
+                        rate_pct=increase_pct,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    _update_table_state(table_key, updated)
+                    table_df = updated
+                    st.success(
+                        f"Applied a {increase_pct:.2f}% annual increase across the production horizon for {label} ({column})."
+                    )
 
         with col_decrease:
             decrease_pct = st.number_input(
@@ -820,14 +870,17 @@ def _render_yearly_increment_helper(
                 key=f"{table_key}_decrease_pct",
             )
             if st.button("Apply decrease", key=f"{table_key}_apply_decrease"):
-                factor = 1 - decrease_pct / 100.0
-                if factor <= 0:
+                updated = table_df.copy()
+                try:
+                    updated[column] = _propagate_yearly_pattern(
+                        updated[column],
+                        base_value,
+                        mode="decrease",
+                        rate_pct=decrease_pct,
+                    )
+                except ValueError:
                     st.error("Decrease must be less than 100% to maintain positive values.")
                 else:
-                    periods = len(table_df)
-                    decay = np.array([factor**i for i in range(periods)], dtype=float)
-                    updated = table_df.copy()
-                    updated[column] = base_value * decay
                     _update_table_state(table_key, updated)
                     table_df = updated
                     st.success(
@@ -1102,7 +1155,13 @@ revenue_defaults = pd.DataFrame(
 )
 
 production_annual_defaults = pd.DataFrame(
-    [{"Year": inputs.timeline.start_year + i, "Throughput (t)": inputs.tech.msw_tonnes_pa} for i in range(5)]
+    [
+        {
+            "Year": inputs.timeline.start_year + i,
+            "Throughput (t)": inputs.tech.msw_tonnes_pa,
+        }
+        for i in range(inputs.timeline.years)
+    ]
 )
 
 production_monthly_defaults = pd.DataFrame(
