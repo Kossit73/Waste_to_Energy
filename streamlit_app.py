@@ -1025,17 +1025,17 @@ def _reset_scalar_values(values: Dict[str, Any]) -> None:
         st.session_state[key] = value
 
 
-def _resolve_production_throughput_profile(
+def _derive_production_schedule(
     projection: ProjectionSettings,
-) -> Optional[List[float]]:
-    """Return a per-period throughput profile derived from the annual schedule."""
+) -> pd.Series:
+    """Return the user-configured annual throughput schedule."""
 
     table = st.session_state.get("production_annual")
     if not isinstance(table, pd.DataFrame) or table.empty:
-        return None
+        return pd.Series(dtype=float)
 
     if "Year" not in table.columns:
-        return None
+        return pd.Series(dtype=float)
 
     if "Throughput (t)" in table.columns:
         throughput_col: Optional[str] = "Throughput (t)"
@@ -1046,11 +1046,11 @@ def _resolve_production_throughput_profile(
         )
 
     if throughput_col is None:
-        return None
+        return pd.Series(dtype=float)
 
     target_years = list(range(projection.start_year, projection.end_year + 1))
     if not target_years:
-        return None
+        return pd.Series(dtype=float)
 
     ordered = table.sort_values(by="Year", kind="stable", na_position="last").reset_index(drop=True)
 
@@ -1079,7 +1079,7 @@ def _resolve_production_throughput_profile(
         values_by_year[year] = value
 
     if not values_by_year:
-        return None
+        return pd.Series(dtype=float)
 
     annual_values: List[float] = []
     last_value = default_value
@@ -1092,10 +1092,23 @@ def _resolve_production_throughput_profile(
         annual_values.append(value)
 
     if not annual_values:
+        return pd.Series(dtype=float)
+
+    schedule_index = pd.Index(target_years, name="Year")
+    return pd.Series(annual_values, index=schedule_index, dtype=float)
+
+
+def _resolve_production_throughput_profile(
+    projection: ProjectionSettings,
+) -> Optional[List[float]]:
+    """Return a per-period throughput profile derived from the annual schedule."""
+
+    schedule = _derive_production_schedule(projection)
+    if schedule.empty:
         return None
 
     ppy = max(1, projection.periods_per_year)
-    return [value / ppy for value in annual_values]
+    return list(schedule.values / ppy)
 
 
 def _reset_table_group(defaults: Dict[str, pd.DataFrame], *, mode: str) -> None:
@@ -2446,6 +2459,14 @@ results["ai_settings"] = copy.deepcopy(st.session_state.get("ai_settings", DEFAU
 summary, summary_ann, summary_cumulative, production_annual_series = build_summary_tables(
     user_inputs, results
 )
+production_schedule_series = _derive_production_schedule(projection)
+if not production_schedule_series.empty:
+    summary_ann = summary_ann.merge(
+        production_schedule_series.rename("Scheduled throughput (t)"),
+        left_on="Calendar Year",
+        right_index=True,
+        how="left",
+    )
 
 if snapshot_placeholder is not None:
     snapshot_placeholder.dataframe(summary.head(12).round(2), use_container_width=True)
@@ -2563,14 +2584,21 @@ with page_tabs[4]:
     irrs_cols[2].metric("Payback (years)", "n/a" if np.isnan(payback_value) else f"{payback_value:.2f}")
 
     st.subheader("Production of Nickel (Annual)")
-    production_chart_df = pd.DataFrame(
-        {
-            "Year": production_annual_series.index + projection.start_year,
-            "Nickel production (t)": production_annual_series.values,
-        }
-    )
-    if not production_chart_df.empty:
-        st.line_chart(production_chart_df.set_index("Year"))
+    modelled_series = production_annual_series.copy()
+    if not modelled_series.empty:
+        modelled_series.index = modelled_series.index + projection.start_year
+        modelled_series.index.name = "Year"
+
+    series_parts: List[pd.Series] = []
+    if not production_schedule_series.empty:
+        series_parts.append(production_schedule_series.rename("Scheduled throughput (t)"))
+    if not modelled_series.empty:
+        series_parts.append(modelled_series.rename("Modelled throughput (t)"))
+
+    chart_df = pd.concat(series_parts, axis=1).dropna(how="all") if series_parts else pd.DataFrame()
+
+    if not chart_df.empty:
+        st.line_chart(chart_df)
     else:
         st.info("Add production assumptions to display the chart.")
 
