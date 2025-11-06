@@ -522,12 +522,8 @@ def _editable_table(
         )
         if updated_df is not None:
             base = updated_df
-    else:
-        st.caption(
-            "Defaults are read-only. Toggle the **Edit** checkbox to change cell values or manage rows."
-        )
 
-    editor_disabled = (not edit_enabled) or row_edit_controls
+    editor_disabled = not edit_enabled
 
     edited = st.data_editor(
         base,
@@ -537,14 +533,19 @@ def _editable_table(
         column_config=column_config or {},
         disabled=editor_disabled,
     )
-    if edit_enabled and not row_edit_controls:
-        _update_table_state(key, edited)
-        return edited
 
-    if row_edit_controls and edit_enabled:
+    if not edit_enabled:
         st.caption(
-            "Click **Edit** beside a row to adjust the values line by line. Saved changes "
-            "immediately refresh the schedules."
+            "Defaults are read-only. Toggle the **Edit** checkbox to change cell values or manage rows."
+        )
+        return base
+
+    _update_table_state(key, edited)
+
+    if row_edit_controls:
+        st.caption(
+            "Update the values directly in the table or use the row controls below for step-by-step "
+            "editing. Saved changes immediately refresh the schedules."
         )
         table = st.session_state[key].copy().reset_index(drop=True)
         label_field = row_label_field
@@ -1389,9 +1390,10 @@ with page_tabs[0]:
             """
             1. **Enable edit mode** – toggle the *Edit* checkbox for the section you want to
                update. Inputs remain read-only until editing is enabled.
-            2. **Edit or extend rows** – once edit mode is active use the *Add row*/*Remove row*
-               buttons to adjust the schedule length, then press **Edit row** beside the line you
-               want to update and submit the form to save changes.
+            2. **Edit or extend rows** – once edit mode is active you can type directly into the
+               table to update values or use the *Add row*/*Remove row* buttons to adjust the
+               schedule length. The optional **Edit row** buttons let you work line by line if you
+               prefer guided forms.
             3. **Manage default sets** – restore the shipped defaults, start with empty tables,
                or save/load your own presets from the *Manage defaults & state* panel.
             4. **Apply structured growth** – each schedule includes a *Yearly increment*
