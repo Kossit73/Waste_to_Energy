@@ -2261,9 +2261,14 @@ direct_costs_monthly_defaults = pd.DataFrame(
 
 staff_monthly_defaults = pd.DataFrame(
     [
-        {"Role": "Operations", "Monthly cost": 250_000},
-        {"Role": "Maintenance", "Monthly cost": 180_000},
-        {"Role": "Administration", "Monthly cost": 120_000},
+        {
+            "Month": m + 1,
+            "Operations staff": 250_000,
+            "Maintenance staff": 180_000,
+            "Administration staff": 120_000,
+            "Other staff costs": 90_000,
+        }
+        for m in range(12)
     ]
 )
 
@@ -2426,7 +2431,7 @@ TABLE_LABELS: Dict[str, str] = {
     "production_annual": "Production annual",
     "production_monthly": "Production monthly",
     "direct_costs_monthly": "Direct costs monthly",
-    "staff_monthly": "Staff monthly",
+    "staff_monthly": "Operational staff schedule",
     "other_opex_monthly": "Other opex monthly",
     "accounts_receivable": "Accounts receivable",
     "inventory_payable": "Inventory & payables",
@@ -2704,6 +2709,38 @@ with page_tabs[0]:
     else:
         st.dataframe(schedule.round(2), use_container_width=True)
 
+    staff_edit = _section_header("Operational staff schedule", "operational_staff_schedule")
+    staff_monthly = _editable_table(
+        "staff_monthly",
+        staff_monthly_defaults,
+        column_config={
+            "Month": st.column_config.NumberColumn("Month", min_value=1, max_value=36, step=1),
+            "Operations staff": st.column_config.NumberColumn(
+                "Operations staff", format="%0.0f"
+            ),
+            "Maintenance staff": st.column_config.NumberColumn(
+                "Maintenance staff", format="%0.0f"
+            ),
+            "Administration staff": st.column_config.NumberColumn(
+                "Administration staff", format="%0.0f"
+            ),
+            "Other staff costs": st.column_config.NumberColumn(
+                "Other staff costs", format="%0.0f"
+            ),
+        },
+        edit_enabled=staff_edit,
+        row_edit_controls=True,
+        row_label_field="Month",
+    )
+    staff_monthly = _render_yearly_increment_helper(
+        "staff_monthly",
+        template=staff_monthly_defaults,
+        label="Operational staff schedule",
+    )
+    st.caption(
+        "Capture all payroll, benefits, overtime, and contractor support in this unified staff schedule."
+    )
+
 
 snapshot_placeholder = None
 
@@ -2926,24 +2963,6 @@ with page_tabs[2]:
         "direct_costs_monthly",
         template=direct_costs_monthly_defaults,
         label="Direct costs monthly",
-    )
-
-    staff_edit = _section_header("Staff Costs (Monthly)", "staff_monthly")
-    staff_monthly = _editable_table(
-        "staff_monthly",
-        staff_monthly_defaults,
-        column_config={
-            "Role": st.column_config.TextColumn("Role"),
-            "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
-        },
-        edit_enabled=staff_edit,
-        row_edit_controls=True,
-        row_label_field="Role",
-    )
-    staff_monthly = _render_yearly_increment_helper(
-        "staff_monthly",
-        template=staff_monthly_defaults,
-        label="Staff costs monthly",
     )
 
     other_opex_edit = _section_header("Other Opex (Monthly)", "other_opex_monthly")
