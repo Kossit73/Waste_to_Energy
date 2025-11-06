@@ -25,9 +25,15 @@ from pandas.api.types import is_bool_dtype, is_integer_dtype, is_numeric_dtype
 from streamlit.delta_generator import DeltaGenerator
 
 from wte_model import (
+    CapexItem,
     CostAssumptions,
+    DebtFacility,
     FinanceAssumptions,
+    OpexComponent,
+    PriceCurve,
     RevenueAssumptions,
+    RevenueStream,
+    TaxAssumptions,
     TechAssumptions,
     Timeline,
     WorkingCapitalAssumptions,
@@ -198,6 +204,429 @@ def _annualise(series: Iterable[float], ppy: int) -> pd.Series:
     annual = df.groupby("year", as_index=False)["value"].sum()
     annual.index = annual["year"]
     return annual["value"]
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        value = cleaned
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    coerced = _coerce_float(value)
+    return default if coerced is None else coerced
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return default
+    try:
+        return int(round(coerced))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_percentage(value: Any, default: float = 0.0) -> float:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return default
+    return coerced / 100.0 if abs(coerced) > 1.0 else coerced
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "yes", "y", "1"}:
+            return True
+        if text in {"false", "no", "n", "0"}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_series_cell(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        parts = list(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        parts = [part.strip() for part in re.split(r"[;,]", cleaned) if part.strip()]
+    else:
+        parts = [value]
+
+    series: List[float] = []
+    for part in parts:
+        coerced = _coerce_float(part)
+        if coerced is None:
+            continue
+        series.append(float(coerced))
+    return series or None
+
+
+def _table_differs(table: Optional[pd.DataFrame], template: Optional[pd.DataFrame]) -> bool:
+    if table is None:
+        return False
+    if template is None:
+        return True
+    try:
+        return not table.reset_index(drop=True).equals(template.reset_index(drop=True))
+    except Exception:
+        return True
+
+
+def _capex_items_from_table(
+    table: Optional[pd.DataFrame],
+    template: Sequence[CapexItem],
+) -> List[CapexItem]:
+    if table is None or table.empty:
+        return [replace(item) for item in template]
+
+    items: List[CapexItem] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Item") or row.get("Asset") or f"Item {idx + 1}"
+        name = str(name_raw).strip() or f"Item {idx + 1}"
+        amount = _safe_float(row.get("Cost"), 0.0)
+        if amount == 0 and not name.strip():
+            continue
+        life_years = max(1, _safe_int(row.get("Life (years)"), 1))
+        bonus_pct = _safe_percentage(row.get("Bonus depreciation (%)"), 0.0)
+        residual_pct = _safe_percentage(row.get("Residual value (%)"), 0.0)
+        method_raw = row.get("Depreciation method") or row.get("Method") or "straight_line"
+        method = str(method_raw).strip().lower().replace(" ", "_")
+        if method not in {"straight_line", "declining_balance"}:
+            method = "straight_line"
+        declining_rate = _parse_series_cell(row.get("Declining balance rate (%)"))
+        declining_value = None
+        if declining_rate:
+            declining_value = _safe_percentage(declining_rate[0], 0.0)
+        spend_profile = _parse_series_cell(row.get("Spend profile"))
+        inflation_curve = _parse_series_cell(row.get("Inflation curve"))
+
+        items.append(
+            CapexItem(
+                name=name,
+                amount=amount,
+                life_years=life_years,
+                bonus_depreciation_pct=bonus_pct,
+                residual_value_pct=residual_pct,
+                method=method,
+                declining_balance_rate=declining_value,
+                spend_profile=spend_profile,
+                inflation_curve=inflation_curve,
+            )
+        )
+
+    if items:
+        return items
+    return [replace(item) for item in template]
+
+
+def _infer_revenue_driver(name: str, raw_driver: Any) -> str:
+    driver_map = {
+        "net_mwh": "net_mwh",
+        "gross_mwh": "gross_mwh",
+        "heat_mwh": "heat_mwh",
+        "tonnes": "tonnes",
+        "tons": "tonnes",
+        "custom": "custom",
+    }
+    if isinstance(raw_driver, str):
+        candidate = raw_driver.strip().lower().replace(" ", "_")
+        if candidate in driver_map:
+            return driver_map[candidate]
+        if candidate in {"electricity", "ppa", "power"}:
+            return "net_mwh"
+        if candidate in {"heat", "steam"}:
+            return "heat_mwh"
+        if candidate in {"waste", "gate", "tipping"}:
+            return "tonnes"
+
+    label = name.lower()
+    if any(token in label for token in ("heat", "steam")):
+        return "heat_mwh"
+    if any(token in label for token in ("ppa", "electric", "power")):
+        return "net_mwh"
+    if any(token in label for token in ("gate", "tipping", "waste")):
+        return "tonnes"
+    return "tonnes"
+
+
+def _revenue_assumptions_from_table(
+    table: Optional[pd.DataFrame],
+    template: RevenueAssumptions,
+) -> RevenueAssumptions:
+    base = copy.deepcopy(template)
+    if table is None or table.empty:
+        return base
+
+    streams: List[RevenueStream] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Revenue stream") or row.get("Stream") or f"Stream {idx + 1}"
+        name = str(name_raw).strip() or f"Stream {idx + 1}"
+        driver = _infer_revenue_driver(name, row.get("Driver"))
+        price = _safe_float(row.get("Price"), 0.0)
+        escalation = _safe_percentage(row.get("Escalation (%)"), 0.0)
+        share = _safe_percentage(row.get("Share"), 1.0)
+        if share == 0:
+            share = _safe_percentage(row.get("Share (%)"), 1.0)
+        quantity_profile = _parse_series_cell(row.get("Quantity profile"))
+        seasonality = _parse_series_cell(row.get("Seasonality"))
+        periodic = _parse_series_cell(row.get("Periodic multipliers"))
+        index_curve = _parse_series_cell(row.get("Index curve"))
+        fx_curve = _parse_series_cell(row.get("FX curve"))
+        adders = _parse_series_cell(row.get("Adders"))
+        currency_raw = row.get("Currency")
+        currency = str(currency_raw).strip() if isinstance(currency_raw, str) else "USD"
+        notes_raw = row.get("Notes")
+        notes = str(notes_raw).strip() if isinstance(notes_raw, str) and notes_raw else None
+
+        price_curve = PriceCurve(
+            base=price,
+            annual_escalation=escalation,
+            periodic_multipliers=periodic,
+            index_curve=index_curve,
+            fx_curve=fx_curve,
+            adders=adders,
+        )
+
+        streams.append(
+            RevenueStream(
+                name=name,
+                driver=driver,
+                price_curve=price_curve,
+                share=share,
+                quantity_profile=quantity_profile,
+                seasonality=seasonality,
+                currency=currency or "USD",
+                notes=notes,
+            )
+        )
+
+    if streams:
+        base.streams = streams
+    return base
+
+
+def _aggregate_pattern(values: Sequence[float], periods_per_year: int) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0 or periods_per_year <= 0:
+        return np.zeros(max(periods_per_year, 1), dtype=float)
+    segment_edges = np.linspace(0.0, 1.0, arr.size + 1)
+    period_edges = np.linspace(0.0, 1.0, periods_per_year + 1)
+    totals = np.zeros(periods_per_year, dtype=float)
+    for seg_idx in range(arr.size):
+        seg_start, seg_end = segment_edges[seg_idx], segment_edges[seg_idx + 1]
+        seg_value = arr[seg_idx]
+        span = seg_end - seg_start
+        if span <= 0:
+            continue
+        for period_idx in range(periods_per_year):
+            period_start, period_end = period_edges[period_idx], period_edges[period_idx + 1]
+            overlap = min(seg_end, period_end) - max(seg_start, period_start)
+            if overlap <= 0:
+                continue
+            totals[period_idx] += seg_value * (overlap / span)
+    return totals
+
+
+def _components_from_monthly_table(
+    table: Optional[pd.DataFrame],
+    timeline: Timeline,
+    *,
+    category_label: str,
+) -> List[OpexComponent]:
+    if table is None or table.empty:
+        return []
+
+    ordered = table.reset_index(drop=True)
+    numeric_cols = [
+        col
+        for col in ordered.columns
+        if is_numeric_dtype(ordered[col]) and not str(col).lower().startswith("month")
+    ]
+    components: List[OpexComponent] = []
+    if not numeric_cols:
+        return components
+
+    for col in numeric_cols:
+        col_values: List[float] = []
+        last_value = 0.0
+        for _, row in ordered.iterrows():
+            value = _coerce_float(row.get(col))
+            if value is None:
+                value = last_value if col_values else 0.0
+            col_values.append(float(value))
+            last_value = float(value)
+
+        if not col_values:
+            continue
+
+        period_pattern = _aggregate_pattern(col_values, timeline.periods_per_year)
+        if not period_pattern.size:
+            continue
+
+        if timeline.years > 1:
+            reps = timeline.years
+        else:
+            reps = 1
+        repeated = np.tile(period_pattern, reps)
+        if repeated.size < timeline.n:
+            reps_needed = (timeline.n + period_pattern.size - 1) // period_pattern.size
+            repeated = np.tile(period_pattern, reps_needed)
+        series = repeated[: timeline.n]
+
+        category = category_label.lower().replace(" ", "_")
+        name = f"{category_label} - {col}" if category_label else str(col)
+        components.append(
+            OpexComponent(
+                name=name,
+                category=category,
+                fixed_annual=0.0,
+                variable_per_unit=1.0,
+                driver="custom",
+                custom_quantity=series.tolist(),
+            )
+        )
+
+    return components
+
+
+def _assemble_opex_components(
+    direct_df: Optional[pd.DataFrame],
+    staff_df: Optional[pd.DataFrame],
+    other_df: Optional[pd.DataFrame],
+    timeline: Timeline,
+) -> List[OpexComponent]:
+    components: List[OpexComponent] = []
+    components.extend(_components_from_monthly_table(direct_df, timeline, category_label="Direct costs"))
+    components.extend(_components_from_monthly_table(staff_df, timeline, category_label="Staff"))
+    components.extend(_components_from_monthly_table(other_df, timeline, category_label="Other opex"))
+    return components
+
+
+def _debt_facilities_from_table(
+    table: Optional[pd.DataFrame],
+    template: Sequence[DebtFacility],
+) -> List[DebtFacility]:
+    if table is None or table.empty:
+        return [replace(item) for item in template]
+
+    facilities: List[DebtFacility] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Facility") or row.get("Lender") or f"Facility {idx + 1}"
+        name = str(name_raw).strip() or f"Facility {idx + 1}"
+        draw_ratio = _safe_percentage(row.get("Draw ratio (%)"), 0.0)
+        commitment = _safe_float(row.get("Base amount"), 0.0)
+        interest_rate = _safe_percentage(row.get("Interest rate (%)"), 0.0)
+        tenor_years = max(0, _safe_int(row.get("Duration (years)"), 0))
+        if tenor_years == 0:
+            tenor_years = max(0, _safe_int(row.get("Tenor (years)"), 0))
+        grace_years = max(0, _safe_int(row.get("Grace (years)"), 0))
+        amort_raw = row.get("Loan type") or row.get("Amortization") or "annuity"
+        amortization = str(amort_raw).strip().lower().replace(" ", "_")
+        if amortization not in {"annuity", "straight_line", "custom", "sculpted"}:
+            amortization = "annuity"
+        custom_amort = _parse_series_cell(row.get("Amort profile"))
+        draw_profile = _parse_series_cell(row.get("Draw profile"))
+        target_dscr = _safe_float(row.get("Target DSCR"), 1.2)
+        sweep_pct = _safe_percentage(row.get("Cash sweep (%)"), 0.0)
+        sweep_trigger = _safe_float(row.get("Cash sweep trigger"), 1.0)
+        upfront_fee = _safe_percentage(row.get("Upfront fee (%)"), 0.0)
+        sculpt_flag = _safe_bool(row.get("Sculpt from CFADS?"), False)
+        interest_cap = _safe_bool(row.get("Capitalise interest"), True)
+
+        if draw_ratio <= 0 and commitment <= 0:
+            continue
+
+        facilities.append(
+            DebtFacility(
+                name=name,
+                draw_ratio=draw_ratio,
+                commitment=commitment if commitment > 0 else None,
+                draw_profile=draw_profile,
+                interest_rate=interest_rate,
+                tenor_years=max(1, tenor_years),
+                grace_years=max(0, grace_years),
+                amortization=amortization,
+                custom_amort_profile=custom_amort,
+                target_dscr=target_dscr,
+                sculpt_from_cfads=sculpt_flag,
+                cash_sweep_pct=sweep_pct,
+                cash_sweep_trigger=sweep_trigger,
+                upfront_fee_pct=upfront_fee,
+                interest_during_construction=interest_cap,
+            )
+        )
+
+    if facilities:
+        return facilities
+    return [replace(item) for item in template]
+
+
+def _tax_assumptions_from_table(
+    table: Optional[pd.DataFrame],
+    base_tax: TaxAssumptions,
+    timeline: Timeline,
+) -> TaxAssumptions:
+    cfg = replace(base_tax)
+    if table is None or table.empty:
+        return cfg
+
+    for _, row in table.iterrows():
+        label_raw = row.get("Tax") or row.get("Parameter") or ""
+        label = str(label_raw).strip().lower()
+        rate_value = row.get("Rate (%)")
+        if label:
+            if "corporate" in label:
+                cfg.corporate_rate = _safe_percentage(rate_value, cfg.corporate_rate)
+            elif "withholding" in label:
+                cfg.withholding_rate = _safe_percentage(rate_value, cfg.withholding_rate)
+            elif "minimum" in label:
+                cfg.minimum_tax_rate = _safe_percentage(rate_value, cfg.minimum_tax_rate)
+            elif "carbon" in label:
+                cfg.carbon_credit_per_mwh = _safe_float(row.get("Value"), cfg.carbon_credit_per_mwh)
+
+        carry_val = row.get("Loss carryforward (years)") or row.get("Carryforward (years)")
+        if carry_val is not None and not pd.isna(carry_val):
+            cfg.carryforward_years = _safe_int(carry_val, cfg.carryforward_years)
+
+        holiday_years = row.get("Holiday (years)") or row.get("Holiday years")
+        if holiday_years is not None and not pd.isna(holiday_years):
+            cfg.holiday_years = max(0, _safe_int(holiday_years, cfg.holiday_years))
+
+        holiday_start = row.get("Holiday start (months)") or row.get("Holiday start")
+        if holiday_start is not None and not pd.isna(holiday_start):
+            months_per_period = 12 / max(1, timeline.periods_per_year)
+            cfg.holiday_start_offset = max(0, _safe_int(float(holiday_start) / months_per_period, cfg.holiday_start_offset))
+
+        allow_loss = row.get("Allow loss carryforward")
+        if allow_loss is not None and not pd.isna(allow_loss):
+            cfg.allow_loss_carryforward = _safe_bool(allow_loss, cfg.allow_loss_carryforward)
+
+        incentives = row.get("Other incentives")
+        parsed_incentives = _parse_series_cell(incentives)
+        if parsed_incentives:
+            cfg.other_incentives = parsed_incentives
+
+    return cfg
 
 
 def _payload_to_ai_settings(payload: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -2393,17 +2822,62 @@ projection = ProjectionSettings(
     periods_per_year=int(st.session_state["projection_ppy"]),
 )
 
-capex_profile = _parse_capex_profile(st.session_state["capex_profile_text"], inputs.costs.capex_spend_profile)
+timeline_cfg = Timeline(
+    years=projection.years,
+    build_months=inputs.timeline.build_months,
+    start_year=projection.start_year,
+    periods_per_year=projection.periods_per_year,
+)
 
-revenue_inputs = RevenueAssumptions()
-revenue_inputs.ppa_price_usd_per_mwh = float(st.session_state["ppa_price"])
-revenue_inputs.ppa_escalation = float(st.session_state["ppa_escalation"])
-revenue_inputs.gate_fee_usd_per_t = float(st.session_state["gate_fee"])
-revenue_inputs.gate_fee_escalation = float(st.session_state["gate_fee_escalation"])
-revenue_inputs.heat_price_usd_per_mwh = float(st.session_state["heat_price"])
-revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery"])
-revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
-revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
+capex_profile = _parse_capex_profile(
+    st.session_state["capex_profile_text"], inputs.costs.capex_spend_profile
+)
+
+capex_items: List[CapexItem] = []
+if _table_differs(initial_investment, initial_investment_defaults):
+    capex_items = _capex_items_from_table(initial_investment, inputs.costs.capex_items)
+
+capex_total_value = float(st.session_state["capex_total"])
+if capex_items:
+    capex_total_value = sum(item.amount for item in capex_items)
+
+revenue_table_changed = _table_differs(revenue_table, revenue_defaults)
+if revenue_table_changed:
+    revenue_inputs = _revenue_assumptions_from_table(revenue_table, inputs.revenue)
+else:
+    revenue_inputs = RevenueAssumptions()
+    revenue_inputs.ppa_price_usd_per_mwh = float(st.session_state["ppa_price"])
+    revenue_inputs.ppa_escalation = float(st.session_state["ppa_escalation"])
+    revenue_inputs.gate_fee_usd_per_t = float(st.session_state["gate_fee"])
+    revenue_inputs.gate_fee_escalation = float(st.session_state["gate_fee_escalation"])
+    revenue_inputs.heat_price_usd_per_mwh = float(st.session_state["heat_price"])
+    revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery"])
+    revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
+    revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
+
+opex_tables_changed = any(
+    _table_differs(df, default)
+    for df, default in (
+        (direct_costs_monthly, direct_costs_monthly_defaults),
+        (staff_monthly, staff_monthly_defaults),
+        (other_opex_monthly, other_opex_monthly_defaults),
+    )
+)
+opex_components: List[OpexComponent] = []
+if opex_tables_changed:
+    opex_components = _assemble_opex_components(
+        direct_costs_monthly,
+        staff_monthly,
+        other_opex_monthly,
+        timeline_cfg,
+    )
+
+loan_table_changed = _table_differs(loan_schedule, loan_schedule_defaults)
+debt_facilities: List[DebtFacility] = []
+if loan_table_changed:
+    debt_facilities = _debt_facilities_from_table(loan_schedule, inputs.finance.debt_facilities)
+
+tax_table_changed = _table_differs(tax_schedule, tax_schedule_defaults)
 
 wc_cfg = _working_capital_from_tables(
     accounts_receivable,
@@ -2411,13 +2885,28 @@ wc_cfg = _working_capital_from_tables(
     inputs.finance.working_capital,
 )
 
+finance_inputs = FinanceAssumptions(
+    debt_ratio=float(st.session_state["debt_ratio"]),
+    interest_rate=float(st.session_state["interest_rate"]),
+    tenor_years=int(st.session_state["tenor_years"]),
+    grace_years=int(st.session_state["grace_years"]),
+    upfront_fee_pct=float(st.session_state["upfront_fee_pct"]),
+    dscr_min=inputs.finance.dscr_min,
+    tax_rate=float(st.session_state["tax_rate"]),
+    depr_years=int(st.session_state["depr_years"]),
+    working_cap_days=int(st.session_state["working_cap_days"]),
+    discount_rate=float(st.session_state["discount_rate"]),
+    working_capital=wc_cfg,
+    debt_facilities=debt_facilities,
+)
+
+if tax_table_changed:
+    finance_inputs.tax = _tax_assumptions_from_table(
+        tax_schedule, finance_inputs.tax, timeline_cfg
+    )
+
 user_inputs = WTEMasterInputs(
-    timeline=Timeline(
-        years=projection.years,
-        build_months=inputs.timeline.build_months,
-        start_year=projection.start_year,
-        periods_per_year=projection.periods_per_year,
-    ),
+    timeline=timeline_cfg,
     tech=TechAssumptions(
         msw_tonnes_pa=float(st.session_state["msw_tonnes_pa"]),
         lhv_mj_per_kg=float(st.session_state["lhv_mj_per_kg"]),
@@ -2429,7 +2918,7 @@ user_inputs = WTEMasterInputs(
     ),
     revenue=revenue_inputs,
     costs=CostAssumptions(
-        capex_total_usd=float(st.session_state["capex_total"]),
+        capex_total_usd=capex_total_value,
         capex_spend_profile=capex_profile,
         fixed_om_usd_pa=float(st.session_state["fixed_om"]),
         variable_om_usd_per_t=float(st.session_state["variable_om"]),
@@ -2437,20 +2926,10 @@ user_inputs = WTEMasterInputs(
         insurance_pct_of_capex_pa=float(st.session_state["insurance_pct"]),
         maintenance_pct_of_capex_pa=float(st.session_state["maintenance_pct"]),
         opex_escalation=float(st.session_state["opex_escalation"]),
+        capex_items=capex_items,
+        opex_components=opex_components,
     ),
-    finance=FinanceAssumptions(
-        debt_ratio=float(st.session_state["debt_ratio"]),
-        interest_rate=float(st.session_state["interest_rate"]),
-        tenor_years=int(st.session_state["tenor_years"]),
-        grace_years=int(st.session_state["grace_years"]),
-        upfront_fee_pct=float(st.session_state["upfront_fee_pct"]),
-        dscr_min=inputs.finance.dscr_min,
-        tax_rate=float(st.session_state["tax_rate"]),
-        depr_years=int(st.session_state["depr_years"]),
-        working_cap_days=int(st.session_state["working_cap_days"]),
-        discount_rate=float(st.session_state["discount_rate"]),
-        working_capital=wc_cfg,
-    ),
+    finance=finance_inputs,
 )
 
 results = cashflow_model(user_inputs)
