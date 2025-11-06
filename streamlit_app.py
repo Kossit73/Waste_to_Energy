@@ -1558,6 +1558,8 @@ with page_tabs[0]:
         st.dataframe(schedule.round(2), use_container_width=True)
 
 
+snapshot_placeholder = None
+
 with page_tabs[1]:
     revenue_edit = _section_header("Revenue Inputs", "revenue_inputs")
     revenue_table = _editable_table(
@@ -1756,7 +1758,7 @@ with page_tabs[1]:
     )
 
     st.subheader("Model Outputs Snapshot")
-    st.dataframe(summary.head(12).round(2), use_container_width=True)
+    snapshot_placeholder = st.empty()
 
 
 with page_tabs[2]:
@@ -2173,6 +2175,9 @@ results["ai_settings"] = copy.deepcopy(st.session_state.get("ai_settings", DEFAU
 summary, summary_ann, summary_cumulative, production_annual_series = build_summary_tables(
     user_inputs, results
 )
+
+if snapshot_placeholder is not None:
+    snapshot_placeholder.dataframe(summary.head(12).round(2), use_container_width=True)
 
 energy = results["energy"]
 revenue = results["rev"]
