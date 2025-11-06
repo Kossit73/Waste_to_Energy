@@ -747,7 +747,7 @@ def _render_yearly_increment_helper(
 
     with st.expander("Yearly increment", expanded=False):
         st.caption(
-            "Apply compound annual adjustments to the numeric columns in this schedule."
+            "Propagate updated values or apply compound adjustments across the production horizon."
         )
 
         if table_df.empty:
@@ -778,23 +778,61 @@ def _render_yearly_increment_helper(
             value=float(base_default),
             key=f"{table_key}_increment_base",
         )
-        increment_pct = st.number_input(
-            "Annual increment (%)",
-            value=0.0,
-            step=0.5,
-            key=f"{table_key}_increment_pct",
-        )
 
-        if st.button("Apply increment", key=f"{table_key}_apply_increment"):
-            periods = len(table_df)
-            growth = np.array([(1 + increment_pct / 100.0) ** i for i in range(periods)], dtype=float)
-            updated = table_df.copy()
-            updated[column] = base_value * growth
-            _update_table_state(table_key, updated)
-            table_df = updated
-            st.success(
-                f"Applied {increment_pct:.2f}% annual increment to {label} ({column})."
+        col_copy, col_increase, col_decrease = st.columns(3)
+
+        with col_copy:
+            if st.button("Copy forward", key=f"{table_key}_copy_forward"):
+                updated = table_df.copy()
+                updated[column] = base_value
+                _update_table_state(table_key, updated)
+                table_df = updated
+                st.success(
+                    f"Copied the base value across the production horizon for {label} ({column})."
+                )
+
+        with col_increase:
+            increase_pct = st.number_input(
+                "Increase (%)",
+                value=0.0,
+                step=0.5,
+                key=f"{table_key}_increase_pct",
             )
+            if st.button("Apply increase", key=f"{table_key}_apply_increase"):
+                factor = 1 + increase_pct / 100.0
+                periods = len(table_df)
+                growth = np.array([factor**i for i in range(periods)], dtype=float)
+                updated = table_df.copy()
+                updated[column] = base_value * growth
+                _update_table_state(table_key, updated)
+                table_df = updated
+                st.success(
+                    f"Applied a {increase_pct:.2f}% annual increase across the production horizon for {label} ({column})."
+                )
+
+        with col_decrease:
+            decrease_pct = st.number_input(
+                "Decrease (%)",
+                value=0.0,
+                step=0.5,
+                min_value=0.0,
+                max_value=99.5,
+                key=f"{table_key}_decrease_pct",
+            )
+            if st.button("Apply decrease", key=f"{table_key}_apply_decrease"):
+                factor = 1 - decrease_pct / 100.0
+                if factor <= 0:
+                    st.error("Decrease must be less than 100% to maintain positive values.")
+                else:
+                    periods = len(table_df)
+                    decay = np.array([factor**i for i in range(periods)], dtype=float)
+                    updated = table_df.copy()
+                    updated[column] = base_value * decay
+                    _update_table_state(table_key, updated)
+                    table_df = updated
+                    st.success(
+                        f"Applied a {decrease_pct:.2f}% annual decrease across the production horizon for {label} ({column})."
+                    )
 
     return table_df
 
@@ -1397,8 +1435,8 @@ with page_tabs[0]:
             3. **Manage default sets** – restore the shipped defaults, start with empty tables,
                or save/load your own presets from the *Manage defaults & state* panel.
             4. **Apply structured growth** – each schedule includes a *Yearly increment*
-               expander directly beneath the table; open it while in edit mode to apply
-               compound annual changes to numeric columns.
+               expander directly beneath the table; open it while in edit mode to copy values
+               forward or apply compound increases/decreases across the production horizon.
             5. **Review downstream impact** – every edit flows automatically into the dashboards,
                statements, and analytics tabs so you can validate changes immediately.
             """
