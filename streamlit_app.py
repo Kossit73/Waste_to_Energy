@@ -890,6 +890,131 @@ def _render_yearly_increment_helper(
     return table_df
 
 
+def _sync_production_annual_with_projection(projection: ProjectionSettings) -> None:
+    """Ensure the annual production schedule mirrors the current projection horizon."""
+
+    table_key = "production_annual"
+    template = production_annual_defaults
+    current_table = _ensure_state_df(table_key, template)
+    if not isinstance(current_table, pd.DataFrame):
+        return
+
+    columns = list(current_table.columns)
+    if "Year" not in columns:
+        return
+
+    if "Throughput (t)" in columns:
+        throughput_col: Optional[str] = "Throughput (t)"
+    elif len(columns) > 1:
+        throughput_col = columns[1]
+    else:
+        throughput_col = None
+
+    if throughput_col is None:
+        return
+
+    target_years = list(range(projection.start_year, projection.end_year + 1))
+    if not target_years:
+        return
+
+    ordered = current_table.sort_values(
+        by="Year", kind="stable", na_position="last"
+    ).reset_index(drop=True)
+
+    ordered_values = ordered[throughput_col].tolist()
+    base_throughput = float(st.session_state.get("msw_tonnes_pa", 0.0))
+    if template is not None and not template.empty:
+        template_value = template[throughput_col].iloc[0]
+        if pd.notna(template_value):
+            base_throughput = float(template_value)
+
+    cleaned_values: List[float] = []
+    if not ordered_values:
+        cleaned_values = [base_throughput]
+    else:
+        fallback = base_throughput
+        for value in ordered_values:
+            if pd.isna(value):
+                if cleaned_values:
+                    cleaned_values.append(cleaned_values[-1])
+                else:
+                    cleaned_values.append(fallback)
+            else:
+                try:
+                    cleaned_values.append(float(value))
+                except (TypeError, ValueError):
+                    cleaned_values.append(fallback if not cleaned_values else cleaned_values[-1])
+        if all(pd.isna(val) for val in ordered_values):
+            cleaned_values = [fallback]
+
+    if not cleaned_values:
+        cleaned_values = [base_throughput]
+
+    if len(cleaned_values) < len(target_years):
+        cleaned_values.extend([cleaned_values[-1]] * (len(target_years) - len(cleaned_values)))
+    elif len(cleaned_values) > len(target_years):
+        cleaned_values = cleaned_values[: len(target_years)]
+
+    existing_by_year: Dict[int, float] = {}
+    for idx, row in ordered.iterrows():
+        year_raw = row.get("Year")
+        if pd.isna(year_raw):
+            continue
+        try:
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            continue
+        if idx < len(cleaned_values):
+            existing_by_year[year] = cleaned_values[idx]
+
+    new_values: List[float] = []
+    for idx, year in enumerate(target_years):
+        value = existing_by_year.get(year)
+        if value is None:
+            if idx < len(cleaned_values):
+                value = cleaned_values[idx]
+            elif new_values:
+                value = new_values[-1]
+            else:
+                value = cleaned_values[-1]
+        new_values.append(value)
+
+    new_df = pd.DataFrame({"Year": target_years, throughput_col: new_values})
+
+    year_dtype = current_table["Year"].dtype
+    try:
+        new_df["Year"] = new_df["Year"].astype(year_dtype)
+    except (TypeError, ValueError):
+        new_df["Year"] = new_df["Year"].astype(int)
+
+    throughput_dtype = current_table[throughput_col].dtype
+    throughput_series = pd.Series(new_values)
+    if is_integer_dtype(throughput_dtype):
+        new_df[throughput_col] = throughput_series.round().astype(throughput_dtype)
+    elif is_numeric_dtype(throughput_dtype):
+        try:
+            new_df[throughput_col] = throughput_series.astype(throughput_dtype)
+        except (TypeError, ValueError):
+            new_df[throughput_col] = throughput_series.astype(float)
+    else:
+        new_df[throughput_col] = throughput_series.astype(float)
+
+    for column in columns:
+        if column not in new_df.columns:
+            new_df[column] = current_table[column]
+    new_df = new_df[columns]
+
+    try:
+        new_df = new_df.astype(current_table.dtypes.to_dict())
+    except (TypeError, ValueError):
+        pass
+
+    if current_table.reset_index(drop=True).equals(new_df.reset_index(drop=True)):
+        return
+
+    _update_table_state(table_key, new_df)
+
+
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
     for key, value in values.items():
         st.session_state[key] = value
@@ -1568,6 +1693,14 @@ with page_tabs[0]:
     st.info(
         "The projection horizon drives the calendar footprint of every table and report in the workspace, "
         "including the monthly and annual statements."
+    )
+
+    _sync_production_annual_with_projection(
+        ProjectionSettings(
+            start_year=int(st.session_state["projection_start_year"]),
+            end_year=int(st.session_state["projection_end_year"]),
+            periods_per_year=int(st.session_state["projection_ppy"]),
+        )
     )
 
     global_edit = _section_header("Global Inputs", "global_inputs")
