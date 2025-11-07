@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import math
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 _REQUIRED_PACKAGES = ("numpy", "pandas", "streamlit")
@@ -25,9 +26,15 @@ from pandas.api.types import is_bool_dtype, is_integer_dtype, is_numeric_dtype
 from streamlit.delta_generator import DeltaGenerator
 
 from wte_model import (
+    CapexItem,
     CostAssumptions,
+    DebtFacility,
     FinanceAssumptions,
+    OpexComponent,
+    PriceCurve,
     RevenueAssumptions,
+    RevenueStream,
+    TaxAssumptions,
     TechAssumptions,
     Timeline,
     WorkingCapitalAssumptions,
@@ -36,7 +43,11 @@ from wte_model import (
     cashflow_model,
     default_inputs,
     generate_excel_bytes,
+    goal_seek,
+    run_monte_carlo,
+    run_sensitivity,
 )
+from wte_model.scenario import DistributionSpec, MonteCarloConfig
 
 
 AI_PROVIDER_OPTIONS = ("OpenAI", "Azure OpenAI", "Anthropic", "Vertex AI", "Custom")
@@ -198,6 +209,859 @@ def _annualise(series: Iterable[float], ppy: int) -> pd.Series:
     annual = df.groupby("year", as_index=False)["value"].sum()
     annual.index = annual["year"]
     return annual["value"]
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        value = cleaned
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    coerced = _coerce_float(value)
+    return default if coerced is None else coerced
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return default
+    try:
+        return int(round(coerced))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_percentage(value: Any, default: float = 0.0) -> float:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return default
+    return coerced / 100.0 if abs(coerced) > 1.0 else coerced
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "yes", "y", "1"}:
+            return True
+        if text in {"false", "no", "n", "0"}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_series_cell(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        parts = list(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        parts = [part.strip() for part in re.split(r"[;,]", cleaned) if part.strip()]
+    else:
+        parts = [value]
+
+    series: List[float] = []
+    for part in parts:
+        coerced = _coerce_float(part)
+        if coerced is None:
+            continue
+        series.append(float(coerced))
+    return series or None
+
+
+def _normalise_label(label: str) -> str:
+    cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(label).strip().lower())
+    return cleaned.strip("_")
+
+
+PARAMETER_PATH_ALIASES: Dict[str, str] = {
+    "ppa_price": "revenue.ppa_price_usd_per_mwh",
+    "ppa_price_usd_per_mwh": "revenue.ppa_price_usd_per_mwh",
+    "ppa_escalation": "revenue.ppa_escalation",
+    "gate_fee": "revenue.gate_fee_usd_per_t",
+    "gate_fee_usd_per_t": "revenue.gate_fee_usd_per_t",
+    "gate_fee_escalation": "revenue.gate_fee_escalation",
+    "heat_price": "revenue.heat_price_usd_per_mwh",
+    "heat_price_usd_per_mwh": "revenue.heat_price_usd_per_mwh",
+    "electricity_price_per_kwh": "revenue.ppa_price_usd_per_mwh",
+    "electricity_price_usd_kwh": "revenue.ppa_price_usd_per_mwh",
+    "metal_recovery": "revenue.metal_recovery_usd_per_t",
+    "ash_revenue": "revenue.ash_revenue_usd_per_t",
+    "capex": "costs.capex_total_usd",
+    "capex_total": "costs.capex_total_usd",
+    "capex_total_usd": "costs.capex_total_usd",
+    "fixed_om": "costs.fixed_om_usd_pa",
+    "fixed_o_m": "costs.fixed_om_usd_pa",
+    "fixed_om_usd_pa": "costs.fixed_om_usd_pa",
+    "variable_om": "costs.variable_om_usd_per_t",
+    "variable_o_m": "costs.variable_om_usd_per_t",
+    "variable_om_usd_per_t": "costs.variable_om_usd_per_t",
+    "opex_per_ton_of_waste": "costs.variable_om_usd_per_t",
+    "landfill_disposal": "costs.landfill_disposal_usd_per_t",
+    "landfill_disposal_usd_per_t": "costs.landfill_disposal_usd_per_t",
+    "insurance_pct": "costs.insurance_pct_of_capex_pa",
+    "insurance_pct_of_capex_pa": "costs.insurance_pct_of_capex_pa",
+    "maintenance_pct": "costs.maintenance_pct_of_capex_pa",
+    "maintenance_pct_of_capex_pa": "costs.maintenance_pct_of_capex_pa",
+    "opex_escalation": "costs.opex_escalation",
+    "debt_ratio": "finance.debt_ratio",
+    "interest_rate": "finance.interest_rate",
+    "upfront_fee": "finance.upfront_fee_pct",
+    "upfront_fee_pct": "finance.upfront_fee_pct",
+    "tenor_years": "finance.tenor_years",
+    "grace_years": "finance.grace_years",
+    "discount_rate": "finance.discount_rate",
+    "tax_rate": "finance.tax_rate",
+    "corporate_tax_rate": "finance.tax_rate",
+    "working_cap_days": "finance.working_cap_days",
+    "depr_years": "finance.depr_years",
+    "availability": "tech.availability",
+    "plant_availability": "tech.availability",
+    "msw_tonnes_pa": "tech.msw_tonnes_pa",
+    "lhv_mj_per_kg": "tech.lhv_mj_per_kg",
+    "boiler_efficiency": "tech.boiler_efficiency",
+    "electrical_efficiency": "tech.electrical_efficiency",
+    "parasitic_load": "tech.parasitic_load_frac",
+}
+
+
+def _parameter_alias_map() -> Dict[str, str]:
+    alias_map = dict(PARAMETER_PATH_ALIASES)
+    df = st.session_state.get("parameter_naming")
+    if df is None or df.empty:
+        return alias_map
+    if "Parameter" not in df.columns or "Preferred name" not in df.columns:
+        return alias_map
+    for _, row in df.iterrows():
+        base_label = _normalise_label(row.get("Parameter", ""))
+        alias_label = _normalise_label(row.get("Preferred name", ""))
+        if not base_label or not alias_label:
+            continue
+        path = PARAMETER_PATH_ALIASES.get(base_label)
+        if path:
+            alias_map[alias_label] = path
+    return alias_map
+
+
+def _resolve_parameter_path(label: str, alias_map: Optional[Dict[str, str]] = None) -> Optional[str]:
+    if label is None:
+        return None
+    label = str(label).strip()
+    if not label:
+        return None
+    if "." in label or "[" in label:
+        return label
+    mapping = alias_map or _parameter_alias_map()
+    normalised = _normalise_label(label)
+    return mapping.get(normalised)
+
+
+def _read_input_value(root: WTEMasterInputs, path: str) -> Optional[float]:
+    try:
+        current: Any = root
+        for token in path.split("."):
+            if "[" in token and token.endswith("]"):
+                attr, idx = token[:-1].split("[")
+                current = getattr(current, attr)[int(idx)]
+            else:
+                current = getattr(current, token)
+        if isinstance(current, (int, float, np.number)):
+            return float(current)
+        return _coerce_float(current)
+    except Exception:
+        return None
+
+
+def _apply_adjustment(base_value: float, adjustment: Any) -> Optional[float]:
+    if adjustment is None:
+        return None
+    adj_value = _coerce_float(adjustment)
+    if adj_value is None:
+        return None
+    if abs(base_value) <= 1e-9:
+        return adj_value
+    if abs(adj_value) <= 1.5:
+        return float(base_value) * (1.0 + float(adj_value))
+    return float(adj_value)
+
+
+def _macro_indices_from_table(
+    table: Optional[pd.DataFrame],
+    timeline: Timeline,
+) -> Dict[str, List[float]]:
+    if table is None or table.empty:
+        return {}
+
+    macro: Dict[str, List[float]] = {}
+    horizon_years = max(1, int(timeline.years))
+    for _, row in table.iterrows():
+        category_raw = row.get("Category") or row.get("Label")
+        category = str(category_raw).strip() if category_raw is not None else ""
+        if not category:
+            continue
+        key = _normalise_label(category)
+        explicit_series = (
+            _parse_series_cell(row.get("Series"))
+            or _parse_series_cell(row.get("Inflation curve"))
+        )
+        if explicit_series:
+            values = [float(val) for val in explicit_series if _coerce_float(val) is not None]
+        else:
+            rate = _coerce_float(row.get("Inflation rate (%)"))
+            if rate is None:
+                continue
+            rate = rate / 100.0 if abs(rate) > 1.0 else rate
+            values = [float(rate)]
+        if not values:
+            continue
+        repeat = max(1, math.ceil(horizon_years / len(values)))
+        expanded = (values * repeat)[:horizon_years]
+        macro[key] = expanded
+    return macro
+
+
+def _risk_summary_from_table(table: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if table is None or table.empty:
+        return pd.DataFrame()
+    if "Probability (%)" not in table.columns or "Impact (USD)" not in table.columns:
+        return pd.DataFrame()
+    df = table.copy()
+    df["Probability (%)"] = df["Probability (%)"].apply(lambda v: _safe_float(v, 0.0))
+    df["Impact (USD)"] = df["Impact (USD)"].apply(lambda v: _safe_float(v, 0.0))
+    df["Expected loss (USD)"] = df["Probability (%)"] / 100.0 * df["Impact (USD)"]
+    return df
+
+
+METRIC_ALIASES: Dict[str, str] = {
+    "equity_irr": "irr_eq",
+    "project_irr": "irr_proj",
+    "dscr": "dscr_min",
+    "irr_eq": "irr_eq",
+    "irr_proj": "irr_proj",
+    "dscr_min": "dscr_min",
+}
+
+
+def _resolve_metric_code(label: str) -> Optional[str]:
+    if not label:
+        return None
+    normalised = _normalise_label(label)
+    return METRIC_ALIASES.get(normalised)
+
+
+def _sensitivity_results_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return pd.DataFrame(), warnings
+    if "Driver" not in table.columns:
+        warnings.append("Sensitivity table is missing a 'Driver' column.")
+        return pd.DataFrame(), warnings
+
+    alias_map = _parameter_alias_map()
+    records: List[Dict[str, Any]] = []
+
+    for _, row in table.iterrows():
+        driver_label = str(row.get("Driver", "")).strip()
+        if not driver_label:
+            continue
+        path = _resolve_parameter_path(driver_label, alias_map)
+        if not path:
+            warnings.append(f"Could not map driver '{driver_label}' to a model input.")
+            continue
+        base_value = _read_input_value(base_inputs, path)
+        if base_value is None:
+            warnings.append(f"Unable to read the current value for '{driver_label}'.")
+            continue
+
+        case_labels: List[str] = []
+        case_values: List[float] = []
+        for label_name in ("Low", "Base", "High"):
+            adjusted = _apply_adjustment(float(base_value), row.get(label_name))
+            if label_name == "Base" and adjusted is None:
+                adjusted = float(base_value)
+            if adjusted is None:
+                continue
+            case_labels.append(label_name)
+            case_values.append(float(adjusted))
+
+        if not case_values:
+            case_labels = ["Base"]
+            case_values = [float(base_value)]
+
+        unique_labels: List[str] = []
+        unique_values: List[float] = []
+        seen: Set[Tuple[str, float]] = set()
+        for label_name, value in zip(case_labels, case_values):
+            key = (label_name, round(float(value), 12))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_labels.append(label_name)
+            unique_values.append(float(value))
+
+        try:
+            outputs = run_sensitivity(base_inputs, path, unique_values)
+        except Exception as exc:
+            warnings.append(f"Sensitivity run for '{driver_label}' failed: {exc}")
+            continue
+
+        for label_name, result in zip(unique_labels, outputs):
+            records.append(
+                {
+                    "Driver": driver_label,
+                    "Case": label_name,
+                    "Test value": float(result.get("value", float("nan"))),
+                    "Equity IRR": float(result.get("irr_eq", float("nan"))),
+                    "Project IRR": float(result.get("irr_proj", float("nan"))),
+                    "DSCR minimum": float(result.get("dscr_min", float("nan"))),
+                }
+            )
+
+    return pd.DataFrame(records), warnings
+
+
+def _monte_carlo_config_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[Optional[MonteCarloConfig], List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return None, warnings
+    if "Variable" not in table.columns:
+        warnings.append("Monte Carlo table is missing a 'Variable' column.")
+        return None, warnings
+
+    alias_map = _parameter_alias_map()
+
+    iterations = 500
+    if "Iterations" in table.columns:
+        first_iter = table["Iterations"].dropna().iloc[0] if not table["Iterations"].dropna().empty else None
+        if first_iter is not None:
+            iterations = max(1, int(_safe_int(first_iter, iterations)))
+
+    seed: Optional[int] = None
+    if "Seed" in table.columns:
+        first_seed = table["Seed"].dropna().iloc[0] if not table["Seed"].dropna().empty else None
+        if first_seed is not None:
+            seed = int(_safe_int(first_seed, 0))
+
+    distributions: List[DistributionSpec] = []
+
+    for _, row in table.iterrows():
+        variable = str(row.get("Variable", "")).strip()
+        if not variable:
+            continue
+        path = _resolve_parameter_path(variable, alias_map)
+        if not path:
+            warnings.append(f"Could not map Monte Carlo variable '{variable}' to a model input.")
+            continue
+
+        dist_raw = row.get("Distribution", "normal")
+        dist = str(dist_raw).strip().lower() if isinstance(dist_raw, str) else "normal"
+        base_value = _read_input_value(base_inputs, path) or 0.0
+
+        params: Dict[str, float] = {}
+        minimum = _coerce_float(row.get("Min"))
+        maximum = _coerce_float(row.get("Max"))
+
+        if dist == "normal":
+            mean = _coerce_float(row.get("Mean"))
+            std = _coerce_float(row.get("Std dev"))
+            params["mean"] = float(base_value if mean is None else mean)
+            params["std"] = float(abs(base_value) * 0.05 if std is None else std)
+            if params["std"] <= 0:
+                params["std"] = max(1e-6, abs(params["mean"]) * 0.01)
+        elif dist == "triangular":
+            left = _coerce_float(row.get("Left"))
+            mode = _coerce_float(row.get("Mode"))
+            right = _coerce_float(row.get("Right"))
+            if mode is None:
+                mode = _coerce_float(row.get("Mean"))
+            if left is None or right is None:
+                spread = _coerce_float(row.get("Std dev"))
+                if spread is None:
+                    spread = abs(base_value) * 0.1 or 1.0
+                centre = mode if mode is not None else base_value
+                left = centre - spread
+                right = centre + spread
+            if mode is None:
+                mode = base_value
+            params.update({
+                "left": float(left),
+                "mode": float(mode),
+                "right": float(right),
+            })
+        elif dist == "uniform":
+            low = _coerce_float(row.get("Low"))
+            high = _coerce_float(row.get("High"))
+            if low is None or high is None:
+                width = _coerce_float(row.get("Std dev")) or abs(base_value) * 0.1 or 1.0
+                centre = _coerce_float(row.get("Mean")) or base_value
+                low = (centre or 0.0) - width
+                high = (centre or 0.0) + width
+            params.update({"low": float(low), "high": float(high)})
+        elif dist == "lognormal":
+            mean = _coerce_float(row.get("Mean"))
+            sigma = _coerce_float(row.get("Std dev"))
+            params["mean"] = float(math.log(max(base_value, 1e-6)) if mean is None else mean)
+            params["sigma"] = float(abs(base_value) * 0.05 if sigma is None else sigma)
+        else:
+            warnings.append(f"Unsupported distribution '{dist}' for variable '{variable}'.")
+            continue
+
+        distributions.append(
+            DistributionSpec(
+                path=path,
+                dist=dist,
+                params=params,
+                minimum=None if minimum is None else float(minimum),
+                maximum=None if maximum is None else float(maximum),
+            )
+        )
+
+    if not distributions:
+        warnings.append("No valid Monte Carlo distributions configured.")
+        return None, warnings
+
+    config = MonteCarloConfig(iterations=iterations, seed=seed, distributions=distributions)
+    return config, warnings
+
+
+def _goal_seek_results_from_table(
+    table: Optional[pd.DataFrame],
+    base_inputs: WTEMasterInputs,
+) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    if table is None or table.empty:
+        return pd.DataFrame(), warnings
+    if "Target metric" not in table.columns or "Variable" not in table.columns:
+        warnings.append("Goal seek table requires 'Target metric' and 'Variable' columns.")
+        return pd.DataFrame(), warnings
+
+    alias_map = _parameter_alias_map()
+    records: List[Dict[str, Any]] = []
+
+    for _, row in table.iterrows():
+        metric_label = str(row.get("Target metric", "")).strip()
+        metric_code = _resolve_metric_code(metric_label)
+        if not metric_code:
+            warnings.append(f"Unsupported target metric '{metric_label}'.")
+            continue
+
+        variable_label = str(row.get("Variable", "")).strip()
+        path = _resolve_parameter_path(variable_label, alias_map)
+        if not path:
+            warnings.append(f"Could not map goal seek variable '{variable_label}' to a model input.")
+            continue
+
+        target_value_raw = row.get("Target value")
+        target_value = _coerce_float(target_value_raw)
+        if target_value is None:
+            warnings.append(f"Target value for '{metric_label}' is not numeric.")
+            continue
+
+        base_value = _read_input_value(base_inputs, path)
+        if base_value is None:
+            warnings.append(f"Unable to read the current value for '{variable_label}'.")
+            continue
+
+        min_override = _coerce_float(row.get("Min"))
+        max_override = _coerce_float(row.get("Max"))
+        span = abs(base_value) if abs(base_value) > 1e-9 else max(abs(target_value), 1.0)
+        lower = float(min_override) if min_override is not None else float(base_value - span)
+        upper = float(max_override) if max_override is not None else float(base_value + span)
+        if lower == upper:
+            upper = lower + (abs(lower) or 1.0)
+
+        if lower > upper:
+            lower, upper = upper, lower
+
+        try:
+            result = goal_seek(base_inputs, path, metric_code, float(target_value), (lower, upper))
+        except Exception as exc:
+            warnings.append(f"Goal seek for '{metric_label}' failed: {exc}")
+            continue
+
+        records.append(
+            {
+                "Metric": metric_label,
+                "Variable": variable_label,
+                "Target": float(target_value),
+                "Solution": float(result.get("value", float("nan"))),
+                "Metric achieved": float(result.get(metric_code, float("nan"))),
+                "Bracket": f"[{lower:.4g}, {upper:.4g}]",
+            }
+        )
+
+    return pd.DataFrame(records), warnings
+
+
+def _table_differs(table: Optional[pd.DataFrame], template: Optional[pd.DataFrame]) -> bool:
+    if table is None:
+        return False
+    if template is None:
+        return True
+    try:
+        return not table.reset_index(drop=True).equals(template.reset_index(drop=True))
+    except Exception:
+        return True
+
+
+def _capex_items_from_table(
+    table: Optional[pd.DataFrame],
+    template: Sequence[CapexItem],
+) -> List[CapexItem]:
+    if table is None or table.empty:
+        return [replace(item) for item in template]
+
+    items: List[CapexItem] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Item") or row.get("Asset") or f"Item {idx + 1}"
+        name = str(name_raw).strip() or f"Item {idx + 1}"
+        amount = _safe_float(row.get("Cost"), 0.0)
+        if amount == 0 and not name.strip():
+            continue
+        life_years = max(1, _safe_int(row.get("Life (years)"), 1))
+        bonus_pct = _safe_percentage(row.get("Bonus depreciation (%)"), 0.0)
+        residual_pct = _safe_percentage(row.get("Residual value (%)"), 0.0)
+        method_raw = row.get("Depreciation method") or row.get("Method") or "straight_line"
+        method = str(method_raw).strip().lower().replace(" ", "_")
+        if method not in {"straight_line", "declining_balance"}:
+            method = "straight_line"
+        declining_rate = _parse_series_cell(row.get("Declining balance rate (%)"))
+        declining_value = None
+        if declining_rate:
+            declining_value = _safe_percentage(declining_rate[0], 0.0)
+        spend_profile = _parse_series_cell(row.get("Spend profile"))
+        inflation_curve = _parse_series_cell(row.get("Inflation curve"))
+
+        items.append(
+            CapexItem(
+                name=name,
+                amount=amount,
+                life_years=life_years,
+                bonus_depreciation_pct=bonus_pct,
+                residual_value_pct=residual_pct,
+                method=method,
+                declining_balance_rate=declining_value,
+                spend_profile=spend_profile,
+                inflation_curve=inflation_curve,
+            )
+        )
+
+    if items:
+        return items
+    return [replace(item) for item in template]
+
+
+def _infer_revenue_driver(name: str, raw_driver: Any) -> str:
+    driver_map = {
+        "net_mwh": "net_mwh",
+        "gross_mwh": "gross_mwh",
+        "heat_mwh": "heat_mwh",
+        "tonnes": "tonnes",
+        "tons": "tonnes",
+        "custom": "custom",
+    }
+    if isinstance(raw_driver, str):
+        candidate = raw_driver.strip().lower().replace(" ", "_")
+        if candidate in driver_map:
+            return driver_map[candidate]
+        if candidate in {"electricity", "ppa", "power"}:
+            return "net_mwh"
+        if candidate in {"heat", "steam"}:
+            return "heat_mwh"
+        if candidate in {"waste", "gate", "tipping"}:
+            return "tonnes"
+
+    label = name.lower()
+    if any(token in label for token in ("heat", "steam")):
+        return "heat_mwh"
+    if any(token in label for token in ("ppa", "electric", "power")):
+        return "net_mwh"
+    if any(token in label for token in ("gate", "tipping", "waste")):
+        return "tonnes"
+    return "tonnes"
+
+
+def _revenue_assumptions_from_table(
+    table: Optional[pd.DataFrame],
+    template: RevenueAssumptions,
+) -> RevenueAssumptions:
+    base = copy.deepcopy(template)
+    if table is None or table.empty:
+        return base
+
+    streams: List[RevenueStream] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Revenue stream") or row.get("Stream") or f"Stream {idx + 1}"
+        name = str(name_raw).strip() or f"Stream {idx + 1}"
+        driver = _infer_revenue_driver(name, row.get("Driver"))
+        price = _safe_float(row.get("Price"), 0.0)
+        escalation = _safe_percentage(row.get("Escalation (%)"), 0.0)
+        share = _safe_percentage(row.get("Share"), 1.0)
+        if share == 0:
+            share = _safe_percentage(row.get("Share (%)"), 1.0)
+        quantity_profile = _parse_series_cell(row.get("Quantity profile"))
+        seasonality = _parse_series_cell(row.get("Seasonality"))
+        periodic = _parse_series_cell(row.get("Periodic multipliers"))
+        index_curve = _parse_series_cell(row.get("Index curve"))
+        fx_curve = _parse_series_cell(row.get("FX curve"))
+        adders = _parse_series_cell(row.get("Adders"))
+        currency_raw = row.get("Currency")
+        currency = str(currency_raw).strip() if isinstance(currency_raw, str) else "USD"
+        notes_raw = row.get("Notes")
+        notes = str(notes_raw).strip() if isinstance(notes_raw, str) and notes_raw else None
+
+        price_curve = PriceCurve(
+            base=price,
+            annual_escalation=escalation,
+            periodic_multipliers=periodic,
+            index_curve=index_curve,
+            fx_curve=fx_curve,
+            adders=adders,
+        )
+
+        streams.append(
+            RevenueStream(
+                name=name,
+                driver=driver,
+                price_curve=price_curve,
+                share=share,
+                quantity_profile=quantity_profile,
+                seasonality=seasonality,
+                currency=currency or "USD",
+                notes=notes,
+            )
+        )
+
+    if streams:
+        base.streams = streams
+    return base
+
+
+def _aggregate_pattern(values: Sequence[float], periods_per_year: int) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0 or periods_per_year <= 0:
+        return np.zeros(max(periods_per_year, 1), dtype=float)
+    segment_edges = np.linspace(0.0, 1.0, arr.size + 1)
+    period_edges = np.linspace(0.0, 1.0, periods_per_year + 1)
+    totals = np.zeros(periods_per_year, dtype=float)
+    for seg_idx in range(arr.size):
+        seg_start, seg_end = segment_edges[seg_idx], segment_edges[seg_idx + 1]
+        seg_value = arr[seg_idx]
+        span = seg_end - seg_start
+        if span <= 0:
+            continue
+        for period_idx in range(periods_per_year):
+            period_start, period_end = period_edges[period_idx], period_edges[period_idx + 1]
+            overlap = min(seg_end, period_end) - max(seg_start, period_start)
+            if overlap <= 0:
+                continue
+            totals[period_idx] += seg_value * (overlap / span)
+    return totals
+
+
+def _components_from_monthly_table(
+    table: Optional[pd.DataFrame],
+    timeline: Timeline,
+    *,
+    category_label: str,
+) -> List[OpexComponent]:
+    if table is None or table.empty:
+        return []
+
+    ordered = table.reset_index(drop=True)
+    numeric_cols = [
+        col
+        for col in ordered.columns
+        if is_numeric_dtype(ordered[col]) and not str(col).lower().startswith("month")
+    ]
+    components: List[OpexComponent] = []
+    if not numeric_cols:
+        return components
+
+    for col in numeric_cols:
+        col_values: List[float] = []
+        last_value = 0.0
+        for _, row in ordered.iterrows():
+            value = _coerce_float(row.get(col))
+            if value is None:
+                value = last_value if col_values else 0.0
+            col_values.append(float(value))
+            last_value = float(value)
+
+        if not col_values:
+            continue
+
+        period_pattern = _aggregate_pattern(col_values, timeline.periods_per_year)
+        if not period_pattern.size:
+            continue
+
+        if timeline.years > 1:
+            reps = timeline.years
+        else:
+            reps = 1
+        repeated = np.tile(period_pattern, reps)
+        if repeated.size < timeline.n:
+            reps_needed = (timeline.n + period_pattern.size - 1) // period_pattern.size
+            repeated = np.tile(period_pattern, reps_needed)
+        series = repeated[: timeline.n]
+
+        category = category_label.lower().replace(" ", "_")
+        name = f"{category_label} - {col}" if category_label else str(col)
+        components.append(
+            OpexComponent(
+                name=name,
+                category=category,
+                fixed_annual=0.0,
+                variable_per_unit=1.0,
+                driver="custom",
+                custom_quantity=series.tolist(),
+            )
+        )
+
+    return components
+
+
+def _assemble_opex_components(
+    direct_df: Optional[pd.DataFrame],
+    staff_df: Optional[pd.DataFrame],
+    other_df: Optional[pd.DataFrame],
+    timeline: Timeline,
+) -> List[OpexComponent]:
+    components: List[OpexComponent] = []
+    components.extend(_components_from_monthly_table(direct_df, timeline, category_label="Direct costs"))
+    components.extend(_components_from_monthly_table(staff_df, timeline, category_label="Staff"))
+    components.extend(_components_from_monthly_table(other_df, timeline, category_label="Other opex"))
+    return components
+
+
+def _debt_facilities_from_table(
+    table: Optional[pd.DataFrame],
+    template: Sequence[DebtFacility],
+) -> List[DebtFacility]:
+    if table is None or table.empty:
+        return [replace(item) for item in template]
+
+    facilities: List[DebtFacility] = []
+    for idx, row in table.reset_index(drop=True).iterrows():
+        name_raw = row.get("Facility") or row.get("Lender") or f"Facility {idx + 1}"
+        name = str(name_raw).strip() or f"Facility {idx + 1}"
+        draw_ratio = _safe_percentage(row.get("Draw ratio (%)"), 0.0)
+        commitment = _safe_float(row.get("Base amount"), 0.0)
+        interest_rate = _safe_percentage(row.get("Interest rate (%)"), 0.0)
+        tenor_years = max(0, _safe_int(row.get("Duration (years)"), 0))
+        if tenor_years == 0:
+            tenor_years = max(0, _safe_int(row.get("Tenor (years)"), 0))
+        grace_years = max(0, _safe_int(row.get("Grace (years)"), 0))
+        amort_raw = row.get("Loan type") or row.get("Amortization") or "annuity"
+        amortization = str(amort_raw).strip().lower().replace(" ", "_")
+        if amortization not in {"annuity", "straight_line", "custom", "sculpted"}:
+            amortization = "annuity"
+        custom_amort = _parse_series_cell(row.get("Amort profile"))
+        draw_profile = _parse_series_cell(row.get("Draw profile"))
+        target_dscr = _safe_float(row.get("Target DSCR"), 1.2)
+        sweep_pct = _safe_percentage(row.get("Cash sweep (%)"), 0.0)
+        sweep_trigger = _safe_float(row.get("Cash sweep trigger"), 1.0)
+        upfront_fee = _safe_percentage(row.get("Upfront fee (%)"), 0.0)
+        sculpt_flag = _safe_bool(row.get("Sculpt from CFADS?"), False)
+        interest_cap = _safe_bool(row.get("Capitalise interest"), True)
+
+        if draw_ratio <= 0 and commitment <= 0:
+            continue
+
+        facilities.append(
+            DebtFacility(
+                name=name,
+                draw_ratio=draw_ratio,
+                commitment=commitment if commitment > 0 else None,
+                draw_profile=draw_profile,
+                interest_rate=interest_rate,
+                tenor_years=max(1, tenor_years),
+                grace_years=max(0, grace_years),
+                amortization=amortization,
+                custom_amort_profile=custom_amort,
+                target_dscr=target_dscr,
+                sculpt_from_cfads=sculpt_flag,
+                cash_sweep_pct=sweep_pct,
+                cash_sweep_trigger=sweep_trigger,
+                upfront_fee_pct=upfront_fee,
+                interest_during_construction=interest_cap,
+            )
+        )
+
+    if facilities:
+        return facilities
+    return [replace(item) for item in template]
+
+
+def _tax_assumptions_from_table(
+    table: Optional[pd.DataFrame],
+    base_tax: TaxAssumptions,
+    timeline: Timeline,
+) -> TaxAssumptions:
+    cfg = replace(base_tax)
+    if table is None or table.empty:
+        return cfg
+
+    for _, row in table.iterrows():
+        label_raw = row.get("Tax") or row.get("Parameter") or ""
+        label = str(label_raw).strip().lower()
+        rate_value = row.get("Rate (%)")
+        if label:
+            if "corporate" in label:
+                cfg.corporate_rate = _safe_percentage(rate_value, cfg.corporate_rate)
+            elif "withholding" in label:
+                cfg.withholding_rate = _safe_percentage(rate_value, cfg.withholding_rate)
+            elif "minimum" in label:
+                cfg.minimum_tax_rate = _safe_percentage(rate_value, cfg.minimum_tax_rate)
+            elif "carbon" in label:
+                cfg.carbon_credit_per_mwh = _safe_float(row.get("Value"), cfg.carbon_credit_per_mwh)
+
+        carry_val = row.get("Loss carryforward (years)") or row.get("Carryforward (years)")
+        if carry_val is not None and not pd.isna(carry_val):
+            cfg.carryforward_years = _safe_int(carry_val, cfg.carryforward_years)
+
+        holiday_years = row.get("Holiday (years)") or row.get("Holiday years")
+        if holiday_years is not None and not pd.isna(holiday_years):
+            cfg.holiday_years = max(0, _safe_int(holiday_years, cfg.holiday_years))
+
+        holiday_start = row.get("Holiday start (months)") or row.get("Holiday start")
+        if holiday_start is not None and not pd.isna(holiday_start):
+            months_per_period = 12 / max(1, timeline.periods_per_year)
+            cfg.holiday_start_offset = max(0, _safe_int(float(holiday_start) / months_per_period, cfg.holiday_start_offset))
+
+        allow_loss = row.get("Allow loss carryforward")
+        if allow_loss is not None and not pd.isna(allow_loss):
+            cfg.allow_loss_carryforward = _safe_bool(allow_loss, cfg.allow_loss_carryforward)
+
+        incentives = row.get("Other incentives")
+        parsed_incentives = _parse_series_cell(incentives)
+        if parsed_incentives:
+            cfg.other_incentives = parsed_incentives
+
+    return cfg
 
 
 def _payload_to_ai_settings(payload: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -789,6 +1653,11 @@ def _render_yearly_increment_helper(
         st.caption(
             "Propagate updated values or apply compound adjustments across the production horizon."
         )
+        st.markdown(
+            "The helper overwrites values starting from the first year. Set a **Base value** and use"
+            " the buttons to copy it forward or compound an annual percentage change; each subsequent"
+            " year applies the chosen growth or reduction to the previous year's amount."
+        )
 
         if table_df.empty:
             st.info("Add rows to the table to enable yearly increments.")
@@ -890,9 +1759,220 @@ def _render_yearly_increment_helper(
     return table_df
 
 
+def _sync_production_annual_with_projection(projection: ProjectionSettings) -> None:
+    """Ensure the annual production schedule mirrors the current projection horizon."""
+
+    table_key = "production_annual"
+    template = production_annual_defaults
+    current_table = _ensure_state_df(table_key, template)
+    if not isinstance(current_table, pd.DataFrame):
+        return
+
+    columns = list(current_table.columns)
+    if "Year" not in columns:
+        return
+
+    if "Throughput (t)" in columns:
+        throughput_col: Optional[str] = "Throughput (t)"
+    elif len(columns) > 1:
+        throughput_col = columns[1]
+    else:
+        throughput_col = None
+
+    if throughput_col is None:
+        return
+
+    target_years = list(range(projection.start_year, projection.end_year + 1))
+    if not target_years:
+        return
+
+    ordered = current_table.sort_values(
+        by="Year", kind="stable", na_position="last"
+    ).reset_index(drop=True)
+
+    ordered_values = ordered[throughput_col].tolist()
+    base_throughput = float(st.session_state.get("msw_tonnes_pa", 0.0))
+    if template is not None and not template.empty:
+        template_value = template[throughput_col].iloc[0]
+        if pd.notna(template_value):
+            base_throughput = float(template_value)
+
+    cleaned_values: List[float] = []
+    if not ordered_values:
+        cleaned_values = [base_throughput]
+    else:
+        fallback = base_throughput
+        for value in ordered_values:
+            if pd.isna(value):
+                if cleaned_values:
+                    cleaned_values.append(cleaned_values[-1])
+                else:
+                    cleaned_values.append(fallback)
+            else:
+                try:
+                    cleaned_values.append(float(value))
+                except (TypeError, ValueError):
+                    cleaned_values.append(fallback if not cleaned_values else cleaned_values[-1])
+        if all(pd.isna(val) for val in ordered_values):
+            cleaned_values = [fallback]
+
+    if not cleaned_values:
+        cleaned_values = [base_throughput]
+
+    if len(cleaned_values) < len(target_years):
+        cleaned_values.extend([cleaned_values[-1]] * (len(target_years) - len(cleaned_values)))
+    elif len(cleaned_values) > len(target_years):
+        cleaned_values = cleaned_values[: len(target_years)]
+
+    existing_by_year: Dict[int, float] = {}
+    for idx, row in ordered.iterrows():
+        year_raw = row.get("Year")
+        if pd.isna(year_raw):
+            continue
+        try:
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            continue
+        if idx < len(cleaned_values):
+            existing_by_year[year] = cleaned_values[idx]
+
+    new_values: List[float] = []
+    for idx, year in enumerate(target_years):
+        value = existing_by_year.get(year)
+        if value is None:
+            if idx < len(cleaned_values):
+                value = cleaned_values[idx]
+            elif new_values:
+                value = new_values[-1]
+            else:
+                value = cleaned_values[-1]
+        new_values.append(value)
+
+    new_df = pd.DataFrame({"Year": target_years, throughput_col: new_values})
+
+    year_dtype = current_table["Year"].dtype
+    try:
+        new_df["Year"] = new_df["Year"].astype(year_dtype)
+    except (TypeError, ValueError):
+        new_df["Year"] = new_df["Year"].astype(int)
+
+    throughput_dtype = current_table[throughput_col].dtype
+    throughput_series = pd.Series(new_values)
+    if is_integer_dtype(throughput_dtype):
+        new_df[throughput_col] = throughput_series.round().astype(throughput_dtype)
+    elif is_numeric_dtype(throughput_dtype):
+        try:
+            new_df[throughput_col] = throughput_series.astype(throughput_dtype)
+        except (TypeError, ValueError):
+            new_df[throughput_col] = throughput_series.astype(float)
+    else:
+        new_df[throughput_col] = throughput_series.astype(float)
+
+    for column in columns:
+        if column not in new_df.columns:
+            new_df[column] = current_table[column]
+    new_df = new_df[columns]
+
+    try:
+        new_df = new_df.astype(current_table.dtypes.to_dict())
+    except (TypeError, ValueError):
+        pass
+
+    if current_table.reset_index(drop=True).equals(new_df.reset_index(drop=True)):
+        return
+
+    _update_table_state(table_key, new_df)
+
+
 def _reset_scalar_values(values: Dict[str, Any]) -> None:
     for key, value in values.items():
         st.session_state[key] = value
+
+
+def _derive_production_schedule(
+    projection: ProjectionSettings,
+) -> pd.Series:
+    """Return the user-configured annual throughput schedule."""
+
+    table = st.session_state.get("production_annual")
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return pd.Series(dtype=float)
+
+    if "Year" not in table.columns:
+        return pd.Series(dtype=float)
+
+    if "Throughput (t)" in table.columns:
+        throughput_col: Optional[str] = "Throughput (t)"
+    else:
+        throughput_col = next(
+            (col for col in table.columns if col != "Year" and is_numeric_dtype(table[col])),
+            None,
+        )
+
+    if throughput_col is None:
+        return pd.Series(dtype=float)
+
+    target_years = list(range(projection.start_year, projection.end_year + 1))
+    if not target_years:
+        return pd.Series(dtype=float)
+
+    ordered = table.sort_values(by="Year", kind="stable", na_position="last").reset_index(drop=True)
+
+    default_value = float(st.session_state.get("msw_tonnes_pa", 0.0))
+    if "Throughput (t)" in production_annual_defaults.columns and not production_annual_defaults.empty:
+        template_value = production_annual_defaults["Throughput (t)"].iloc[0]
+        if pd.notna(template_value):
+            default_value = float(template_value)
+
+    values_by_year: Dict[int, float] = {}
+    for _, row in ordered.iterrows():
+        year_raw = row.get("Year")
+        if pd.isna(year_raw):
+            continue
+        try:
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            continue
+        raw_value = row.get(throughput_col)
+        if pd.isna(raw_value):
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        values_by_year[year] = value
+
+    if not values_by_year:
+        return pd.Series(dtype=float)
+
+    annual_values: List[float] = []
+    last_value = default_value
+    for year in target_years:
+        value = values_by_year.get(year)
+        if value is None:
+            value = last_value
+        else:
+            last_value = value
+        annual_values.append(value)
+
+    if not annual_values:
+        return pd.Series(dtype=float)
+
+    schedule_index = pd.Index(target_years, name="Year")
+    return pd.Series(annual_values, index=schedule_index, dtype=float)
+
+
+def _resolve_production_throughput_profile(
+    projection: ProjectionSettings,
+) -> Optional[List[float]]:
+    """Return a per-period throughput profile derived from the annual schedule."""
+
+    schedule = _derive_production_schedule(projection)
+    if schedule.empty:
+        return None
+
+    ppy = max(1, projection.periods_per_year)
+    return list(schedule.values / ppy)
 
 
 def _reset_table_group(defaults: Dict[str, pd.DataFrame], *, mode: str) -> None:
@@ -1181,9 +2261,14 @@ direct_costs_monthly_defaults = pd.DataFrame(
 
 staff_monthly_defaults = pd.DataFrame(
     [
-        {"Role": "Operations", "Monthly cost": 250_000},
-        {"Role": "Maintenance", "Monthly cost": 180_000},
-        {"Role": "Administration", "Monthly cost": 120_000},
+        {
+            "Month": m + 1,
+            "Operations staff": 250_000,
+            "Maintenance staff": 180_000,
+            "Administration staff": 120_000,
+            "Other staff costs": 90_000,
+        }
+        for m in range(12)
     ]
 )
 
@@ -1346,7 +2431,7 @@ TABLE_LABELS: Dict[str, str] = {
     "production_annual": "Production annual",
     "production_monthly": "Production monthly",
     "direct_costs_monthly": "Direct costs monthly",
-    "staff_monthly": "Staff monthly",
+    "staff_monthly": "Operational staff schedule",
     "other_opex_monthly": "Other opex monthly",
     "accounts_receivable": "Accounts receivable",
     "inventory_payable": "Inventory & payables",
@@ -1570,6 +2655,14 @@ with page_tabs[0]:
         "including the monthly and annual statements."
     )
 
+    _sync_production_annual_with_projection(
+        ProjectionSettings(
+            start_year=int(st.session_state["projection_start_year"]),
+            end_year=int(st.session_state["projection_end_year"]),
+            periods_per_year=int(st.session_state["projection_ppy"]),
+        )
+    )
+
     global_edit = _section_header("Global Inputs", "global_inputs")
     global_inputs = _editable_table(
         "global_inputs",
@@ -1615,6 +2708,38 @@ with page_tabs[0]:
         st.info("Add rows to the investment table to generate depreciation schedules.")
     else:
         st.dataframe(schedule.round(2), use_container_width=True)
+
+    staff_edit = _section_header("Operational staff schedule", "operational_staff_schedule")
+    staff_monthly = _editable_table(
+        "staff_monthly",
+        staff_monthly_defaults,
+        column_config={
+            "Month": st.column_config.NumberColumn("Month", min_value=1, max_value=36, step=1),
+            "Operations staff": st.column_config.NumberColumn(
+                "Operations staff", format="%0.0f"
+            ),
+            "Maintenance staff": st.column_config.NumberColumn(
+                "Maintenance staff", format="%0.0f"
+            ),
+            "Administration staff": st.column_config.NumberColumn(
+                "Administration staff", format="%0.0f"
+            ),
+            "Other staff costs": st.column_config.NumberColumn(
+                "Other staff costs", format="%0.0f"
+            ),
+        },
+        edit_enabled=staff_edit,
+        row_edit_controls=True,
+        row_label_field="Month",
+    )
+    staff_monthly = _render_yearly_increment_helper(
+        "staff_monthly",
+        template=staff_monthly_defaults,
+        label="Operational staff schedule",
+    )
+    st.caption(
+        "Capture all payroll, benefits, overtime, and contractor support in this unified staff schedule."
+    )
 
 
 snapshot_placeholder = None
@@ -1838,24 +2963,6 @@ with page_tabs[2]:
         "direct_costs_monthly",
         template=direct_costs_monthly_defaults,
         label="Direct costs monthly",
-    )
-
-    staff_edit = _section_header("Staff Costs (Monthly)", "staff_monthly")
-    staff_monthly = _editable_table(
-        "staff_monthly",
-        staff_monthly_defaults,
-        column_config={
-            "Role": st.column_config.TextColumn("Role"),
-            "Monthly cost": st.column_config.NumberColumn("Monthly cost", format="%0.0f"),
-        },
-        edit_enabled=staff_edit,
-        row_edit_controls=True,
-        row_label_field="Role",
-    )
-    staff_monthly = _render_yearly_increment_helper(
-        "staff_monthly",
-        template=staff_monthly_defaults,
-        label="Staff costs monthly",
     )
 
     other_opex_edit = _section_header("Other Opex (Monthly)", "other_opex_monthly")
@@ -2162,6 +3269,15 @@ with page_tabs[3]:
         label="Risk schedule",
     )
 
+    risk_summary = _risk_summary_from_table(risk_schedule)
+    if not risk_summary.empty:
+        st.markdown("**Risk exposure summary**")
+        st.dataframe(risk_summary.round(2), use_container_width=True)
+        expected_loss = risk_summary["Expected loss (USD)"].sum()
+        st.metric("Total expected loss", f"${expected_loss:,.0f}")
+    else:
+        st.info("Populate the risk table to calculate expected losses.")
+
 
 projection = ProjectionSettings(
     start_year=int(st.session_state["projection_start_year"]),
@@ -2169,17 +3285,62 @@ projection = ProjectionSettings(
     periods_per_year=int(st.session_state["projection_ppy"]),
 )
 
-capex_profile = _parse_capex_profile(st.session_state["capex_profile_text"], inputs.costs.capex_spend_profile)
+timeline_cfg = Timeline(
+    years=projection.years,
+    build_months=inputs.timeline.build_months,
+    start_year=projection.start_year,
+    periods_per_year=projection.periods_per_year,
+)
 
-revenue_inputs = RevenueAssumptions()
-revenue_inputs.ppa_price_usd_per_mwh = float(st.session_state["ppa_price"])
-revenue_inputs.ppa_escalation = float(st.session_state["ppa_escalation"])
-revenue_inputs.gate_fee_usd_per_t = float(st.session_state["gate_fee"])
-revenue_inputs.gate_fee_escalation = float(st.session_state["gate_fee_escalation"])
-revenue_inputs.heat_price_usd_per_mwh = float(st.session_state["heat_price"])
-revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery"])
-revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
-revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
+capex_profile = _parse_capex_profile(
+    st.session_state["capex_profile_text"], inputs.costs.capex_spend_profile
+)
+
+capex_items: List[CapexItem] = []
+if _table_differs(initial_investment, initial_investment_defaults):
+    capex_items = _capex_items_from_table(initial_investment, inputs.costs.capex_items)
+
+capex_total_value = float(st.session_state["capex_total"])
+if capex_items:
+    capex_total_value = sum(item.amount for item in capex_items)
+
+revenue_table_changed = _table_differs(revenue_table, revenue_defaults)
+if revenue_table_changed:
+    revenue_inputs = _revenue_assumptions_from_table(revenue_table, inputs.revenue)
+else:
+    revenue_inputs = RevenueAssumptions()
+    revenue_inputs.ppa_price_usd_per_mwh = float(st.session_state["ppa_price"])
+    revenue_inputs.ppa_escalation = float(st.session_state["ppa_escalation"])
+    revenue_inputs.gate_fee_usd_per_t = float(st.session_state["gate_fee"])
+    revenue_inputs.gate_fee_escalation = float(st.session_state["gate_fee_escalation"])
+    revenue_inputs.heat_price_usd_per_mwh = float(st.session_state["heat_price"])
+    revenue_inputs.metal_recovery_usd_per_t = float(st.session_state["metal_recovery"])
+    revenue_inputs.ash_revenue_usd_per_t = float(st.session_state["ash_revenue"])
+    revenue_inputs.other_escalation = float(st.session_state["other_escalation"])
+
+opex_tables_changed = any(
+    _table_differs(df, default)
+    for df, default in (
+        (direct_costs_monthly, direct_costs_monthly_defaults),
+        (staff_monthly, staff_monthly_defaults),
+        (other_opex_monthly, other_opex_monthly_defaults),
+    )
+)
+opex_components: List[OpexComponent] = []
+if opex_tables_changed:
+    opex_components = _assemble_opex_components(
+        direct_costs_monthly,
+        staff_monthly,
+        other_opex_monthly,
+        timeline_cfg,
+    )
+
+loan_table_changed = _table_differs(loan_schedule, loan_schedule_defaults)
+debt_facilities: List[DebtFacility] = []
+if loan_table_changed:
+    debt_facilities = _debt_facilities_from_table(loan_schedule, inputs.finance.debt_facilities)
+
+tax_table_changed = _table_differs(tax_schedule, tax_schedule_defaults)
 
 wc_cfg = _working_capital_from_tables(
     accounts_receivable,
@@ -2187,13 +3348,32 @@ wc_cfg = _working_capital_from_tables(
     inputs.finance.working_capital,
 )
 
+finance_inputs = FinanceAssumptions(
+    debt_ratio=float(st.session_state["debt_ratio"]),
+    interest_rate=float(st.session_state["interest_rate"]),
+    tenor_years=int(st.session_state["tenor_years"]),
+    grace_years=int(st.session_state["grace_years"]),
+    upfront_fee_pct=float(st.session_state["upfront_fee_pct"]),
+    dscr_min=inputs.finance.dscr_min,
+    tax_rate=float(st.session_state["tax_rate"]),
+    depr_years=int(st.session_state["depr_years"]),
+    working_cap_days=int(st.session_state["working_cap_days"]),
+    discount_rate=float(st.session_state["discount_rate"]),
+    working_capital=wc_cfg,
+    debt_facilities=debt_facilities,
+)
+
+finance_inputs.macro_indices = _macro_indices_from_table(
+    inflation_schedule, timeline_cfg
+)
+
+if tax_table_changed:
+    finance_inputs.tax = _tax_assumptions_from_table(
+        tax_schedule, finance_inputs.tax, timeline_cfg
+    )
+
 user_inputs = WTEMasterInputs(
-    timeline=Timeline(
-        years=projection.years,
-        build_months=inputs.timeline.build_months,
-        start_year=projection.start_year,
-        periods_per_year=projection.periods_per_year,
-    ),
+    timeline=timeline_cfg,
     tech=TechAssumptions(
         msw_tonnes_pa=float(st.session_state["msw_tonnes_pa"]),
         lhv_mj_per_kg=float(st.session_state["lhv_mj_per_kg"]),
@@ -2201,10 +3381,11 @@ user_inputs = WTEMasterInputs(
         electrical_efficiency=float(st.session_state["electrical_efficiency"]),
         availability=float(st.session_state["availability"]),
         parasitic_load_frac=float(st.session_state["parasitic_load"]),
+        tonnes_profile=_resolve_production_throughput_profile(projection),
     ),
     revenue=revenue_inputs,
     costs=CostAssumptions(
-        capex_total_usd=float(st.session_state["capex_total"]),
+        capex_total_usd=capex_total_value,
         capex_spend_profile=capex_profile,
         fixed_om_usd_pa=float(st.session_state["fixed_om"]),
         variable_om_usd_per_t=float(st.session_state["variable_om"]),
@@ -2212,20 +3393,10 @@ user_inputs = WTEMasterInputs(
         insurance_pct_of_capex_pa=float(st.session_state["insurance_pct"]),
         maintenance_pct_of_capex_pa=float(st.session_state["maintenance_pct"]),
         opex_escalation=float(st.session_state["opex_escalation"]),
+        capex_items=capex_items,
+        opex_components=opex_components,
     ),
-    finance=FinanceAssumptions(
-        debt_ratio=float(st.session_state["debt_ratio"]),
-        interest_rate=float(st.session_state["interest_rate"]),
-        tenor_years=int(st.session_state["tenor_years"]),
-        grace_years=int(st.session_state["grace_years"]),
-        upfront_fee_pct=float(st.session_state["upfront_fee_pct"]),
-        dscr_min=inputs.finance.dscr_min,
-        tax_rate=float(st.session_state["tax_rate"]),
-        depr_years=int(st.session_state["depr_years"]),
-        working_cap_days=int(st.session_state["working_cap_days"]),
-        discount_rate=float(st.session_state["discount_rate"]),
-        working_capital=wc_cfg,
-    ),
+    finance=finance_inputs,
 )
 
 results = cashflow_model(user_inputs)
@@ -2234,6 +3405,14 @@ results["ai_settings"] = copy.deepcopy(st.session_state.get("ai_settings", DEFAU
 summary, summary_ann, summary_cumulative, production_annual_series = build_summary_tables(
     user_inputs, results
 )
+production_schedule_series = _derive_production_schedule(projection)
+if not production_schedule_series.empty:
+    summary_ann = summary_ann.merge(
+        production_schedule_series.rename("Scheduled throughput (t)"),
+        left_on="Calendar Year",
+        right_index=True,
+        how="left",
+    )
 
 if snapshot_placeholder is not None:
     snapshot_placeholder.dataframe(summary.head(12).round(2), use_container_width=True)
@@ -2351,14 +3530,21 @@ with page_tabs[4]:
     irrs_cols[2].metric("Payback (years)", "n/a" if np.isnan(payback_value) else f"{payback_value:.2f}")
 
     st.subheader("Production of Nickel (Annual)")
-    production_chart_df = pd.DataFrame(
-        {
-            "Year": production_annual_series.index + projection.start_year,
-            "Nickel production (t)": production_annual_series.values,
-        }
-    )
-    if not production_chart_df.empty:
-        st.line_chart(production_chart_df.set_index("Year"))
+    modelled_series = production_annual_series.copy()
+    if not modelled_series.empty:
+        modelled_series.index = modelled_series.index + projection.start_year
+        modelled_series.index.name = "Year"
+
+    series_parts: List[pd.Series] = []
+    if not production_schedule_series.empty:
+        series_parts.append(production_schedule_series.rename("Scheduled throughput (t)"))
+    if not modelled_series.empty:
+        series_parts.append(modelled_series.rename("Modelled throughput (t)"))
+
+    chart_df = pd.concat(series_parts, axis=1).dropna(how="all") if series_parts else pd.DataFrame()
+
+    if not chart_df.empty:
+        st.line_chart(chart_df)
     else:
         st.info("Add production assumptions to display the chart.")
 
@@ -2565,25 +3751,22 @@ with page_tabs[8]:
     )
 
     st.subheader("Simulation Results")
-    simulated = []
-    for _, row in sensitivity_config.iterrows():
-        driver = row.get("Driver", "")
-        try:
-            base_adj = float(row.get("Base", 0.0))
-            low_adj = float(row.get("Low", 0.0))
-            high_adj = float(row.get("High", 0.0))
-        except (TypeError, ValueError):
-            continue
-        simulated.append(
-            {
-                "Driver": driver,
-                "Low IRR": results["irr_eq"] + low_adj,
-                "Base IRR": results["irr_eq"] + base_adj,
-                "High IRR": results["irr_eq"] + high_adj,
-            }
+    sensitivity_results_df, sensitivity_warnings = _sensitivity_results_from_table(
+        sensitivity_config, user_inputs
+    )
+    for msg in sensitivity_warnings:
+        st.warning(msg)
+    if sensitivity_results_df.empty:
+        st.info("Add drivers to the sensitivity table to evaluate alternative cases.")
+    else:
+        st.dataframe(sensitivity_results_df.round(4), use_container_width=True)
+        pivot = sensitivity_results_df.pivot_table(
+            index="Driver",
+            columns="Case",
+            values="Equity IRR",
         )
-    sensitivity_results = pd.DataFrame(simulated)
-    st.dataframe(sensitivity_results.round(4), use_container_width=True)
+        if not pivot.empty:
+            st.line_chart(pivot)
 
     monte_edit = _section_header("Monte Carlo Simulation Configuration", "monte_carlo_config")
     monte_carlo_defaults_runtime = pd.DataFrame(
@@ -2620,11 +3803,25 @@ with page_tabs[8]:
         template=monte_carlo_defaults_runtime,
         label="Monte Carlo configuration",
     )
-    if not monte_carlo_config.empty:
-        st.write(
-            "Simulated IRR range (conceptual):",
-            f"{(results['irr_eq'] - 0.02) * 100:.2f}% to {(results['irr_eq'] + 0.02) * 100:.2f}%",
-        )
+    mc_config, mc_warnings = _monte_carlo_config_from_table(monte_carlo_config, user_inputs)
+    for msg in mc_warnings:
+        st.warning(msg)
+    if mc_config is None:
+        st.info("Provide at least one valid distribution to run the Monte Carlo simulation.")
+    else:
+        try:
+            mc_results = run_monte_carlo(user_inputs, mc_config)
+        except Exception as exc:
+            st.error(f"Monte Carlo simulation failed: {exc}")
+        else:
+            summary_df = pd.DataFrame(mc_results["summary"]).T
+            summary_df.index.name = "Metric"
+            st.markdown("**Monte Carlo summary (mean / percentiles)**")
+            st.dataframe(summary_df.round(4), use_container_width=True)
+            records_df = pd.DataFrame(mc_results.get("records", []))
+            if not records_df.empty:
+                st.markdown("**Sampled outcomes**")
+                st.dataframe(records_df.head(20).round(4), use_container_width=True)
 
 
 with page_tabs[9]:
@@ -2648,32 +3845,15 @@ with page_tabs[9]:
     )
 
     st.subheader("Goal Seek Results")
-    if goal_seek.empty:
+    goal_seek_results_df, goal_seek_warnings = _goal_seek_results_from_table(
+        goal_seek, user_inputs
+    )
+    for msg in goal_seek_warnings:
+        st.warning(msg)
+    if goal_seek_results_df.empty:
         st.info("Add goal seek configurations to calculate required adjustments.")
     else:
-        results_rows = []
-        for _, row in goal_seek.iterrows():
-            metric = row.get("Target metric", "")
-            try:
-                target_value = float(row.get("Target value", 0.0))
-            except (TypeError, ValueError):
-                target_value = 0.0
-            base_value = {
-                "Equity IRR": results["irr_eq"],
-                "Project IRR": results["irr_proj"],
-                "DSCR": float(np.nanmin(results["dscr"])) if results["dscr"].size else float("nan"),
-            }.get(metric, float("nan"))
-            delta = target_value - base_value if not np.isnan(base_value) else float("nan")
-            results_rows.append(
-                {
-                    "Metric": metric,
-                    "Target": target_value,
-                    "Base": base_value,
-                    "Delta": delta,
-                    "Suggested variable": row.get("Variable", ""),
-                }
-            )
-        st.dataframe(pd.DataFrame(results_rows).round(4), use_container_width=True)
+        st.dataframe(goal_seek_results_df.round(4), use_container_width=True)
 
     scenario_edit = _section_header("Scenario / Is Configuration", "scenario_config")
     scenario_config = _editable_table(

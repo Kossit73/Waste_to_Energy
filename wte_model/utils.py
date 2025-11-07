@@ -49,12 +49,12 @@ def expand_series(
     if arr.size == periods:
         return arr
 
-    if periods % arr.size == 0:
-        return np.tile(arr, periods // arr.size)
-
     annual_periods = periods // periods_per_year
     if annual_periods * periods_per_year == periods and arr.size == annual_periods:
         return np.repeat(arr, periods_per_year)[:periods]
+
+    if periods % arr.size == 0:
+        return np.tile(arr, periods // arr.size)
 
     if arr.size == periods_per_year:
         reps = (periods + periods_per_year - 1) // periods_per_year
