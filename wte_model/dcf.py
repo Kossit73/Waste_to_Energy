@@ -25,6 +25,11 @@ def _npv(rate: float, cashflows: List[float]) -> float:
 def _irr(cashflows: List[float], guess: float = 0.1) -> float:
     """Compute internal rate of return using Newton-Raphson with bisection fallback."""
 
+    has_positive = any(cf > 0 for cf in cashflows)
+    has_negative = any(cf < 0 for cf in cashflows)
+    if not (has_positive and has_negative):
+        return float("nan")
+
     rate = guess
     for _ in range(50):
         npv = _npv(rate, cashflows)
@@ -36,7 +41,27 @@ def _irr(cashflows: List[float], guess: float = 0.1) -> float:
             rate = new_rate
         if abs(npv) < 1e-10:
             return rate
-    lo, hi = -0.9, 5.0
+
+    candidate_rates = [-0.9, -0.5, -0.2, 0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    bracket = None
+    prev_rate = candidate_rates[0]
+    prev_npv = _npv(prev_rate, cashflows)
+    if prev_npv == 0:
+        return prev_rate
+    for rate in candidate_rates[1:]:
+        curr_npv = _npv(rate, cashflows)
+        if curr_npv == 0:
+            return rate
+        if prev_npv * curr_npv < 0:
+            bracket = (prev_rate, rate)
+            break
+        prev_rate = rate
+        prev_npv = curr_npv
+
+    if bracket is None:
+        return float("nan")
+
+    lo, hi = bracket
     for _ in range(200):
         mid = (lo + hi) / 2
         v = _npv(mid, cashflows)
@@ -46,7 +71,7 @@ def _irr(cashflows: List[float], guess: float = 0.1) -> float:
             lo = mid
         else:
             hi = mid
-    return rate
+    return float("nan")
 
 
 def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np.ndarray | float]:
@@ -72,6 +97,7 @@ def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np
     tax = None
     cfads = None
 
+    converged = False
     for iteration in range(max_iter):
         interest_cash = debt["interest_cash"]
         taxable_income = ebitda - depreciation_total - interest_cash
@@ -79,12 +105,14 @@ def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np
         cfads = ebitda - tax["cash_tax"] - wc["cash_effect"]
 
         if not debt["needs_cfads"]:
+            converged = True
             break
 
         updated = debt_schedule(inp, capex["total"], cfads=cfads)
         diff = np.max(np.abs(updated["debt_service"] - debt["debt_service"]))
         debt = updated
         if diff < tol:
+            converged = True
             break
 
     # Ensure final cash flows align with converged debt schedule
@@ -133,6 +161,7 @@ def cashflow_model(inp: WTEMasterInputs) -> Dict[str, Dict[str, np.ndarray] | np
         "withholding": withholding,
         "irr_eq": irr_eq,
         "irr_proj": irr_proj,
+        "debt_iterations": iteration + 1,
+        "debt_converged": converged,
         "dscr": np.where(debt_service > 0, cfads / debt_service, np.nan),
     }
-
