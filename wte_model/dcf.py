@@ -42,16 +42,26 @@ def _irr(cashflows: List[float], guess: float = 0.1) -> float:
         if abs(npv) < 1e-10:
             return rate
 
-    lo, hi = -0.9, 5.0
-    f_lo = _npv(lo, cashflows)
-    f_hi = _npv(hi, cashflows)
-    if f_lo == 0:
-        return lo
-    if f_hi == 0:
-        return hi
-    if f_lo * f_hi > 0:
+    candidate_rates = [-0.9, -0.5, -0.2, 0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    bracket = None
+    prev_rate = candidate_rates[0]
+    prev_npv = _npv(prev_rate, cashflows)
+    if prev_npv == 0:
+        return prev_rate
+    for rate in candidate_rates[1:]:
+        curr_npv = _npv(rate, cashflows)
+        if curr_npv == 0:
+            return rate
+        if prev_npv * curr_npv < 0:
+            bracket = (prev_rate, rate)
+            break
+        prev_rate = rate
+        prev_npv = curr_npv
+
+    if bracket is None:
         return float("nan")
 
+    lo, hi = bracket
     for _ in range(200):
         mid = (lo + hi) / 2
         v = _npv(mid, cashflows)
