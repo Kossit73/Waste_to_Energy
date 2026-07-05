@@ -70,12 +70,119 @@ DEFAULT_AI_SETTINGS = {
 }
 
 
+def _inject_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --wte-ink: #172033;
+            --wte-muted: #5f6f85;
+            --wte-brand: #0f766e;
+            --wte-accent: #475569;
+            --wte-panel: rgba(255, 255, 255, 0.9);
+        }
+        .block-container {
+            padding-top: 1.35rem;
+            padding-bottom: 3rem;
+            max-width: 1450px;
+        }
+        .wte-hero {
+            margin-bottom: 1rem;
+            padding: 1.6rem 1.75rem;
+            border-radius: 24px;
+            border: 1px solid rgba(15, 118, 110, 0.16);
+            background:
+                linear-gradient(135deg, rgba(240, 253, 250, 0.98), rgba(255, 255, 255, 0.94)),
+                radial-gradient(circle at top right, rgba(71, 85, 105, 0.12), transparent 32%);
+            box-shadow: 0 18px 42px rgba(15, 23, 42, 0.07);
+        }
+        .wte-kicker {
+            margin: 0 0 0.4rem;
+            color: var(--wte-brand);
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .wte-title {
+            margin: 0;
+            color: var(--wte-ink);
+            font-size: clamp(2rem, 2.7vw, 3rem);
+            font-weight: 800;
+            line-height: 1.05;
+        }
+        .wte-copy {
+            max-width: 60rem;
+            margin: 0.65rem 0 0;
+            color: var(--wte-muted);
+            font-size: 0.98rem;
+            line-height: 1.55;
+        }
+        .wte-workflow {
+            border: 1px solid rgba(15, 118, 110, 0.12);
+            border-radius: 8px;
+            background: var(--wte-panel);
+            color: var(--wte-muted);
+            margin: 0 0 1rem;
+            padding: 0.85rem 1rem;
+        }
+        .wte-workflow strong {
+            color: var(--wte-ink);
+        }
+        div[data-baseweb="tab-list"] {
+            gap: 0.42rem;
+            margin-bottom: 0.9rem;
+        }
+        div[data-baseweb="tab-list"] button {
+            min-height: 2.8rem;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            background: rgba(255, 255, 255, 0.78);
+            color: var(--wte-muted);
+            padding: 0.2rem 0.85rem;
+        }
+        div[data-baseweb="tab-list"] button[aria-selected="true"] {
+            background: linear-gradient(135deg, #0f766e, #334155);
+            border-color: transparent;
+            color: #ffffff;
+            box-shadow: 0 10px 22px rgba(15, 118, 110, 0.15);
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 0.65rem 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_model_hero() -> None:
+    st.markdown(
+        """
+        <section class="wte-hero">
+            <p class="wte-kicker">Infrastructure project finance</p>
+            <h1 class="wte-title">Waste-to-Energy</h1>
+            <p class="wte-copy">
+                Configure feedstock, technology, revenue, opex, financing, taxes,
+                and risk schedules for a plant-level waste-to-energy investment case.
+            </p>
+        </section>
+        <div class="wte-workflow">
+            <strong>Workflow</strong><br>
+            Start with Input Landing, review production and operations, then move through
+            dashboard metrics, statements, sensitivities, scenarios, break-even, and payback.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.set_page_config(page_title="Waste-to-Energy Model", layout="wide")
-st.title("Waste-to-Energy Financial Workspace")
-st.caption(
-    "Configure assumptions in the sections below to build a comprehensive project finance "
-    "model with dashboards, statements, sensitivities, and scenarios."
-)
+_inject_app_theme()
+_render_model_hero()
 
 
 @dataclass
@@ -2750,3 +2857,32 @@ st.info(
     "results, sensitivities, and scenario tools without relying on a sidebar."
 )
 
+
+WTE_STATE_KEYS = [
+    *SCALAR_DEFAULTS.keys(),
+    *TABLE_DEFAULTS.keys(),
+    "ai_settings",
+    "ai_api_key",
+    "ai_payload",
+    "custom_scalar_defaults",
+    "custom_table_defaults",
+    "scenario_payloads",
+    "input_snapshot",
+    "results_snapshot",
+]
+
+
+def get_state() -> dict:
+    """Snapshot user-editable assumptions for NumQuants saved cases."""
+    return {
+        key: st.session_state[key]
+        for key in WTE_STATE_KEYS
+        if key in st.session_state
+    }
+
+
+def set_state(state: dict) -> None:
+    """Restore saved assumptions before the top-level script widgets initialise."""
+    for key, value in state.items():
+        if key in WTE_STATE_KEYS:
+            st.session_state[key] = value
